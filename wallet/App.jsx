@@ -3,7 +3,15 @@
 // see the LICENSE file in this wallet's own directory for the full text and reasoning.
 import { useState, useEffect, useCallback, useRef } from "react";
 
-const VERSION   = "2.2.5";
+const VERSION   = "2.2.6";
+// v2.2.6: API constant switched from a hardcoded absolute URL
+// (different per server) to a relative path ("/api") -- since nginx on
+// every server serves both the wallet's static files AND proxies /api
+// from the same origin, a relative path resolves correctly wherever the
+// page is loaded from. One single build now works on any server,
+// instead of a separate build per server that differed in exactly one
+// line. Found worth simplifying when asked why two near-identical
+// wallet files existed on GitHub.
 // v2.2.5: automatic, one-time wallet-registration grant (10 BIO,
 // first 100 wallets ever created). Fires silently right after a new
 // wallet is confirmed and saved locally -- see tryWalletRegistration()
@@ -146,7 +154,7 @@ function setupPWA(){
   // Service worker не используется — офлайн-кэш не критичен для кошелька,
   // который и так работает только при наличии связи с бэкендом.
 }
-const API       = "https://biochainnetwork.com/api";
+const API       = "/api";  // относительный путь -- один и тот же билд работает на любом сервере, раз кошелёк и API отдаются с одного домена
 const STORE_KEY = "biochain_wallet_v1";
 const BIO_KEY   = "biochain_biometric_v1";
 
