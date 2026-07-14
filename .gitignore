@@ -1,0 +1,55 @@
+# BioChain — .gitignore
+# Critical: this file must be committed BEFORE the first `git add .`,
+# never after. A database or key committed once remains in git history
+# forever, even if deleted in a later commit.
+
+# ── Database (contains real balances, real transaction history) ────
+*.db
+*.db-shm
+*.db-wal
+biochain.db*
+*.sqlite
+*.sqlite3
+
+# ── Backups ──────────────────────────────────────────────────────────
+biochain-backups/
+*.db.bak
+
+# ── Logs ─────────────────────────────────────────────────────────────
+*.log
+biochain.log
+
+# ── Keys, seeds, credentials — never, under any circumstances ──────
+*.pem
+*.key
+seed*.txt
+*keystore*.json
+.env
+.env.*
+
+# ── Python ───────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+venv/
+.venv/
+
+# ── Node / wallet build artifacts ───────────────────────────────────
+node_modules/
+dist/
+.vite/
+
+# ── liboqs build directory (rebuilt by install.sh, not tracked) ────
+liboqs/
+
+# ── OS / editor cruft ────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# ── Local test artifacts ────────────────────────────────────────────
+/tmp/
+snapshots/
