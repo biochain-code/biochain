@@ -3,7 +3,17 @@
 // see the LICENSE file in this wallet's own directory for the full text and reasoning.
 import { useState, useEffect, useCallback, useRef } from "react";
 
-const VERSION   = "2.2.6";
+const VERSION   = "2.2.7";
+// v2.2.7: TRANSACTION HISTORY was displaying the sender's gross value
+// for RECEIVED transfers, not what actually landed in this wallet --
+// the server credits (value - fee) to the receiver while debiting the
+// sender the full gross value, so every incoming entry overstated the
+// real amount by the fee. Found live: several small transfers made the
+// accumulated gap between "history says I received X" and "my balance
+// actually grew by Y" look like a real discrepancy, traced down to
+// this display bug rather than any accounting error. SENT entries were
+// already correct (sender really does pay exactly the gross value) and
+// are unchanged.
 // v2.2.6: API constant switched from a hardcoded absolute URL
 // (different per server) to a relative path ("/api") -- since nginx on
 // every server serves both the wallet's static files AND proxies /api
@@ -2686,7 +2696,22 @@ export default function BiochainWallet(){
                 </div>
                 <div style={{textAlign:"right",marginLeft:8}}>
                   <div style={{fontSize:14,color:out?C.red:C.green,fontWeight:"bold"}}>
-                    {out?"−":"+"}{bl.tx?.value?.toFixed(2)} BIO
+                    {/* v2.2.7 fix: for RECEIVED transactions, the sender's
+                        gross value is NOT what actually landed in this
+                        wallet -- the server credits value-fee to the
+                        receiver (see biochain.py _apply_impulse_effect),
+                        while the sender is debited the full gross value.
+                        Showing raw tx.value for incoming transfers
+                        overstated every single receipt by the fee amount
+                        -- found live, after several small transfers made
+                        the accumulated gap look like a real discrepancy.
+                        The server already exposes tx.fee precisely for
+                        this; SENT stays as gross value (sender really
+                        does pay exactly that, no adjustment needed). */}
+                    {out
+                      ? <>−{bl.tx?.value?.toFixed(2)} BIO</>
+                      : <>+{((bl.tx?.value??0)-(bl.tx?.fee??0)).toFixed(2)} BIO</>
+                    }
                   </div>
                 </div>
               </div>
