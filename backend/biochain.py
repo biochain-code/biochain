@@ -1,5 +1,26 @@
 """
-BioChain — AAECN v5.40 (supply invariant fix + wallet-registration grant
+BioChain — AAECN v5.41 (env-based deployment config)
+
+v5.41: PEER_URLS and SELF_URL moved out of the file into environment
+variables (BIOCHAIN_PEER_URLS, BIOCHAIN_SELF_URL). Every production
+file replacement used to silently reset both to sandbox defaults --
+the single most dangerous recurring operational hazard, once causing a
+real 3-hour chain divergence between the two production servers.
+Config now lives in the systemd unit and survives deployments.
+
+Also in v5.41, for public distribution (GitHub): DEFAULT_BOOTSTRAP_PEERS
+-- the network's public seed nodes, the same role DNS seeds play for
+Bitcoin. A node started with NO configuration at all joins the live
+network out of the box; BIOCHAIN_PEER_URLS overrides the seeds, and
+BIOCHAIN_PEER_URLS=none runs fully standalone (dev/tests). A node
+whose SELF_URL matches a seed filters itself out of its own peer list.
+
+No consensus, economics, or protocol change of any kind in v5.41.
+Also: one comment typo fixed (transfer fee is 0.01 BIO flat, not 0.1
+-- the code was always correct, only the comment was wrong).
+
+Inherited unchanged from v5.40:
+(supply invariant fix + wallet-registration grant
 + automatic majority-based peer promotion + FIFTH invariant bucket:
 pending_unstakes + self-announcement for brand-new nodes + Sybil-resistant node
 emergence + founder vesting extended to 10 years)
@@ -211,6 +232,21 @@ v5.32 changelog (on top of v5.31 consensus fixes + governable longevity):
     erase their own slash record (constitution 5.4 violation) simply by
     staking or unstaking any amount after the penalty. Found and verified
     by live test; same bug class as the v5.31 update_stake_tier fix.
+
+Also in v5.40: cryptographic agility foundation. PQCrypto.address() and
+.verify() now accept an optional scheme_id, defaulting to "MLDSA44" --
+reproducing the exact, original address formula byte-for-byte, so
+every address that has ever existed on BioChain resolves identically.
+A new wallets.sig_scheme column (default 'MLDSA44') lays the
+groundwork for adding a second, genuinely different signature scheme
+later (e.g. SLH-DSA/FIPS 205, chosen for its independent, hash-based
+security assumption, as a hedge against any future lattice-
+cryptanalysis surprise) without a new genesis or breaking a single
+existing address -- directly inspired by Ethereum's account-
+abstraction approach to PQ migration (EIP-8141: agility over a
+permanent, doubled-cost hybrid). Not yet wired through any API
+endpoint -- this is the crypto-layer foundation only, laid now while
+the network is small enough to verify exhaustively.
 """
 
 import time
@@ -447,10 +483,47 @@ PAYLOAD_MAX_CHARS    = 4096          # hard cap on the free-form payload field
 # a STARTING POINT for who to ask -- legitimacy of what comes back is
 # decided entirely by content (see apply_peer_block), never by which URL
 # it came from.
-PEER_URLS = [
-    # "http://203.0.113.5:8000",
-    # "http://203.0.113.6:8000",
+#
+# v5.41 deployment fix: PEER_URLS and SELF_URL are now read from the
+# ENVIRONMENT, not edited inside this file. Every single production file
+# replacement used to silently reset both back to sandbox defaults --
+# once causing a real 3-hour chain divergence. Config now lives in the
+# systemd unit (Environment=BIOCHAIN_PEER_URLS=... / BIOCHAIN_SELF_URL=...)
+# and survives any number of file deployments untouched.
+#   BIOCHAIN_PEER_URLS -- comma-separated base URLs, e.g.
+#       "https://node2.biochainnetwork.com/api"
+#     Set to "none" (or "standalone") to run fully isolated -- for
+#     local development and the regression suite.
+#   BIOCHAIN_SELF_URL  -- this node's own public base URL, e.g.
+#       "https://biochainnetwork.com/api"
+#
+# v5.41 distribution: DEFAULT_BOOTSTRAP_PEERS below are the network's
+# public seed nodes -- the same role DNS seeds play for Bitcoin. Anyone
+# who downloads this code from the public repository and runs it with
+# no configuration at all joins the live BioChain network out of the
+# box: fast-sync from a verified snapshot, then ordinary block sync and
+# gossip-based discovery of further peers. Seeds are a STARTING POINT
+# only, never an authority -- every block that arrives is verified by
+# content (see apply_peer_block), and gossip promotion later widens the
+# peer set beyond the seeds without any code change.
+DEFAULT_BOOTSTRAP_PEERS = [
+    "https://biochainnetwork.com/api",
+    "https://node2.biochainnetwork.com/api",
 ]
+_ENV_PEERS = os.environ.get("BIOCHAIN_PEER_URLS", "").strip()
+# SELF_URL first -- needed below to keep a node from listing itself.
+SELF_URL = os.environ.get("BIOCHAIN_SELF_URL", "").strip().rstrip("/")
+if _ENV_PEERS.lower() in ("none", "standalone", "off"):
+    PEER_URLS = []          # explicit isolation (dev / tests)
+elif _ENV_PEERS:
+    PEER_URLS = [u.strip().rstrip("/") for u in _ENV_PEERS.split(",") if u.strip()]
+else:
+    PEER_URLS = list(DEFAULT_BOOTSTRAP_PEERS)   # public distribution default
+# A seed node's own URL is naturally IN the seed list -- filter it out
+# so a server never syncs against itself (SELF_URL already protects
+# gossip promotion; this protects the initial peer list the same way).
+if SELF_URL:
+    PEER_URLS = [u for u in PEER_URLS if u != SELF_URL]
 PEER_SYNC_INTERVAL_SECONDS = 15
 PEER_REQUEST_TIMEOUT_SECONDS = 5
 
@@ -465,7 +538,8 @@ PEER_REQUEST_TIMEOUT_SECONDS = 5
 # enough to auto-promote server2's own address into its own PEER_URLS.
 # Leave empty ("") if this node has no public URL yet (gossip simply
 # can't self-filter until it's set -- still safe, just less precise).
-SELF_URL = ""
+# v5.41: SELF_URL is read from the environment -- defined ABOVE, next
+# to PEER_URLS, because the bootstrap-seed filter needs it first.
 
 # ─────────────────────────────────────────────
 # PARAMETERS GOVERNABLE BY VOTE
@@ -726,22 +800,55 @@ except ImportError:
     raise SystemExit(1)
 
 class PQCrypto:
+    """
+    v5.40, cryptographic agility foundation: address() and verify() now
+    accept an optional scheme_id, defaulting to "MLDSA44" -- which
+    reproduces the EXACT formula BioChain has always used, byte for
+    byte. No existing address changes. This is deliberately NOT wired
+    through every API endpoint yet (wallets, /tx, /stake etc. all still
+    only know ML-DSA-44) -- it's the crypto-layer foundation only,
+    laid now while the network is small and easy to verify exhaustively,
+    so that adding a genuinely new scheme later (see MATH_SPEC.md's
+    discussion of SLH-DSA as a conservative, hash-based hedge) never
+    requires a new genesis or breaks a single existing address.
+
+    Inspired directly by Ethereum's account-abstraction approach to PQ
+    migration (EIP-8141): agility over a permanent, doubled-cost hybrid
+    -- each address stays on ONE scheme, but the system can support
+    more than one scheme at once without disruption.
+    """
+
     def generate_keypair(self):
         return Dilithium.keygen()
 
     def sign(self, sk, message: str) -> str:
         return Dilithium.sign(sk, message.encode()).hex()
 
-    def verify(self, pk, message: str, signature: str) -> bool:
+    def verify(self, pk, message: str, signature: str, scheme_id: str = "MLDSA44") -> bool:
+        if scheme_id != "MLDSA44":
+            # No other scheme is registered yet -- this branch exists so
+            # that adding one later is a small, local change here, not
+            # a hunt through every call site in the file.
+            print(f"[PQ] verify error: unknown scheme_id '{scheme_id}'")
+            return False
         try:
             return Dilithium.verify(pk, message.encode(), bytes.fromhex(signature))
         except Exception as e:
             print(f"[PQ] verify error: {e}")
             return False
 
-    def address(self, pk) -> str:
+    def address(self, pk, scheme_id: str = "MLDSA44") -> str:
         raw = pk if isinstance(pk, bytes) else str(pk).encode()
-        return "BIO1" + hashlib.sha3_256(raw).hexdigest()[:16].upper()
+        if scheme_id == "MLDSA44":
+            # EXACTLY the original formula -- every address created
+            # before this change continues to resolve identically.
+            return "BIO1" + hashlib.sha3_256(raw).hexdigest()[:16].upper()
+        # Any future scheme folds its own id into the hash, so it can
+        # never collide with an ML-DSA-44 address even given identical
+        # raw key bytes (which shouldn't happen across genuinely
+        # different algorithms anyway, but costs nothing to guarantee).
+        tagged = scheme_id.encode() + raw
+        return "BIO1" + hashlib.sha3_256(tagged).hexdigest()[:16].upper()
 
 pq = PQCrypto()
 
@@ -847,6 +954,15 @@ class Database:
                     -- generation, requiring a real signature so a passive
                     -- /balance lookup on a made-up address can never
                     -- silently consume one of the 100 slots.
+                    ,sig_scheme TEXT DEFAULT 'MLDSA44'  -- v5.40:
+                    -- cryptographic agility foundation. Every wallet that
+                    -- has ever existed on BioChain used ML-DSA-44, so this
+                    -- column is not filled in retroactively from anywhere
+                    -- else -- the DEFAULT itself IS the correct, honest
+                    -- historical value for every existing row. Not yet
+                    -- read by any verification path (see PQCrypto's own
+                    -- docstring) -- reserved for when a second scheme is
+                    -- actually added and endpoints are wired to pass it.
                 );
 
                 CREATE TABLE IF NOT EXISTS nodes (
@@ -1163,6 +1279,19 @@ class Database:
             try:
                 self.conn.execute(
                     "ALTER TABLE wallets ADD COLUMN registration_got INTEGER DEFAULT 0"
+                )
+                self._commit()
+            except Exception:
+                pass  # column already exists
+
+            # v5.40: sig_scheme for wallets rows created before this
+            # column existed. Same safe-to-retry pattern -- DEFAULT
+            # 'MLDSA44' is correct for every row that predates this
+            # column, since ML-DSA-44 is the only scheme that has ever
+            # existed on BioChain.
+            try:
+                self.conn.execute(
+                    "ALTER TABLE wallets ADD COLUMN sig_scheme TEXT DEFAULT 'MLDSA44'"
                 )
                 self._commit()
             except Exception:
@@ -4117,7 +4246,7 @@ class Network:
                     "energy":   round(b.impulse.energy,   4),
                     "phi_bio":  round(b.impulse.phi_bio,  6),
                     # The fee actually charged for this specific kind --
-                    # a flat 0.1 BIO + 0.05% for a TRANSFER, a flat 1 BIO
+                    # a flat 0.01 BIO + 0.05% for a TRANSFER, a flat 1 BIO
                     # for a STAKE (paid on top, not out of the staked
                     # amount), and 0 for UNSTAKE/PROPOSAL/VOTE, which
                     # stay free by design (see _apply_impulse_effect).
@@ -6352,7 +6481,7 @@ async def ws_endpoint(ws: WebSocket):
 if __name__ == "__main__":
     print(f"""
 ╔══════════════════════════════════════════════════╗
-║         BIOCHAIN  AAECN  v5.40                    ║
+║         BIOCHAIN  AAECN  v5.41                    ║
 ║    Organic Node Emergence                         ║
 ╠══════════════════════════════════════════════════╣
 ║  Nodes are born from participant activity         ║
