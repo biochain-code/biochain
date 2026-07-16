@@ -110,66 +110,40 @@ if [ ! -f "$BIOCHAIN_DIR/biochain.py" ]; then
 fi
 echo "      biochain.py found"
 
-# ── Step 5: PEER_URLS -- joining the existing network ─────────────
+# ── Step 5: network identity -- environment-based, not file-edited ────
+# v5.41 moved PEER_URLS/SELF_URL out of biochain.py entirely, into
+# environment variables read at process start (BIOCHAIN_PEER_URLS,
+# BIOCHAIN_SELF_URL). This whole step now just collects shell
+# variables for the systemd unit built in Step 7 -- biochain.py itself
+# is never edited. See MATH_SPEC.md section 12a for why SELF_URL
+# matters (self-filtering during gossip) and DEFAULT_BOOTSTRAP_PEERS
+# (baked into biochain.py itself as public, known-good starting
+# points) for what happens if you leave PEER_URLS blank below.
 echo "[5/7] Network connection setup"
-echo ""
-echo "      Which node(s) should this one connect to? Enter the full"
-echo "      address (e.g. https://biochainnetwork.com/api or"
-echo "      http://1.2.3.4:8000). Separate multiple addresses with spaces."
-echo "      Leave blank to configure PEER_URLS in biochain.py manually later."
-read -rp "      Peer URL(s): " PEER_INPUT
-
-if [ -n "$PEER_INPUT" ]; then
-    PEER_LINES=""
-    for url in $PEER_INPUT; do
-        PEER_LINES="${PEER_LINES}    \"${url}\",\n"
-    done
-    python3 - "$BIOCHAIN_DIR/biochain.py" "$PEER_LINES" <<'PYEOF'
-import sys, re
-path, peer_lines = sys.argv[1], sys.argv[2]
-src = open(path, encoding='utf-8').read()
-pattern = re.compile(r'PEER_URLS = \[\n(?:.*\n)*?\]', re.MULTILINE)
-new_block = f'PEER_URLS = [\n{peer_lines}]'
-if not pattern.search(src):
-    print("WARNING: could not find the PEER_URLS block -- set it manually")
-    sys.exit(0)
-src = pattern.sub(new_block, src, count=1)
-open(path, 'w', encoding='utf-8').write(src)
-print("      PEER_URLS updated")
-PYEOF
-else
-    echo "      skipped -- set PEER_URLS in biochain.py manually"
-fi
-
-# ── Step 5b: SELF_URL -- this node's own public address ───────────
-# Required for gossip/discovery to correctly filter out mentions of
-# THIS node's own address (found live in production: without it, a
-# node can end up auto-promoting itself into its own PEER_URLS the
-# first time a trusted peer, correctly, lists this node among ITS
-# trusted peers during gossip -- see MATH_SPEC.md section 12a).
 echo ""
 echo "      This node's OWN public address (needed for peer discovery"
 echo "      to recognize and ignore mentions of itself -- e.g."
-echo "      https://yourdomain.com/api). Leave blank to skip for now"
-echo "      (discovery will still work, just without this self-check)."
+echo "      https://yourdomain.com/api). Leave blank if this node has"
+echo "      no public URL yet."
 read -rp "      This node's public URL: " SELF_URL_INPUT
 
-if [ -n "$SELF_URL_INPUT" ]; then
-    python3 - "$BIOCHAIN_DIR/biochain.py" "$SELF_URL_INPUT" <<'PYEOF'
-import sys
-path, self_url = sys.argv[1], sys.argv[2]
-src = open(path, encoding='utf-8').read()
-old_line = 'SELF_URL = ""'
-if old_line not in src:
-    print("WARNING: could not find the SELF_URL line -- set it manually")
-    sys.exit(0)
-src = src.replace(old_line, f'SELF_URL = "{self_url}"', 1)
-open(path, 'w', encoding='utf-8').write(src)
-print("      SELF_URL updated")
-PYEOF
-else
-    echo "      skipped -- set SELF_URL in biochain.py manually if you add peers later"
-fi
+echo ""
+echo "      Which node(s) should this one connect to? Enter the full"
+echo "      address (e.g. https://biochainnetwork.com/api), space-"
+echo "      separated for more than one. Leave blank to use the"
+echo "      built-in DEFAULT_BOOTSTRAP_PEERS (biochain.py's own public,"
+echo "      known-good seed list) automatically -- SELF_URL above, if"
+echo "      set, is filtered out of that list for you."
+read -rp "      Peer URL(s) [blank = use defaults]: " PEER_INPUT
+
+echo ""
+echo "      CORS origin for this node's own wallet (e.g."
+echo "      https://yourdomain.com). Leave blank for '*' (any origin --"
+echo "      fine for local/dev use, not recommended once this server is"
+echo "      public -- see biochain.py's own SECURITY log line)."
+read -rp "      CORS origin: " CORS_INPUT
+
+echo "      network identity collected (applied to the service in Step 7)"
 
 # ── Step 6: firewall -- do NOT expose port 8000 publicly ──────────
 echo "[6/7] Configuring firewall..."
@@ -187,6 +161,15 @@ echo "      firewall active (22, 80, 443 open; 8000 stays local-only)"
 # ── Step 7: systemd service + automated backups ────────────────────
 echo "[7/7] Setting up auto-restart and backups..."
 
+# Build the Environment= lines conditionally -- only for values the
+# operator actually provided in Step 5, so an unset one falls back to
+# biochain.py's own defaults (DEFAULT_BOOTSTRAP_PEERS, "" for SELF_URL,
+# "*" for CORS) rather than a literal empty string overriding them.
+ENV_LINES=""
+[ -n "$SELF_URL_INPUT" ] && ENV_LINES="${ENV_LINES}Environment=BIOCHAIN_SELF_URL=${SELF_URL_INPUT}\n"
+[ -n "$PEER_INPUT" ] && ENV_LINES="${ENV_LINES}Environment=BIOCHAIN_PEER_URLS=${PEER_INPUT}\n"
+[ -n "$CORS_INPUT" ] && ENV_LINES="${ENV_LINES}Environment=BIOCHAIN_CORS_ORIGINS=${CORS_INPUT}\n"
+
 sudo tee /etc/systemd/system/biochain.service > /dev/null <<EOF
 [Unit]
 Description=BioChain AAECN Node
@@ -196,6 +179,7 @@ After=network.target
 Type=simple
 User=${USER}
 WorkingDirectory=${BIOCHAIN_DIR}
+$(printf '%b' "$ENV_LINES")
 ExecStart=/usr/bin/python3 ${BIOCHAIN_DIR}/biochain.py
 Restart=on-failure
 RestartSec=5

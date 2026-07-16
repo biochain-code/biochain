@@ -26,6 +26,7 @@ This isn't a whitepaper-only design. As of the current release:
 - **Automatic node discovery, once introduced.** A brand-new node can announce itself (`POST /peer/announce`, matching Bitcoin's `addr` messages / Ethereum's `FINDNODE`) to become visible — this alone grants no trust. Actual promotion into a trusted peer still requires independent confirmation from a strict majority of the existing trust set through normal gossip, the same as any other candidate. A brand-new server can immediately pull the chain from any existing node once pointed at it; an operator on at least one existing trusted node still adds the new URL once, manually, for the reverse direction — from there, gossip and majority promotion spread that trust further automatically.
 - **Sybil-resistant node emergence.** Becoming a live, voting node has always required 21 impulses; it now additionally requires at least 7 real days between an address's first activity and that 21st impulse — turning mass node creation into something that costs real time, not just a script and spare change.
 - **Developer grants.** 509,000 BIO fund real-world builders (wallets, explorers, SDKs, integrations), released only via governance vote, capped at 5,000 BIO per grant.
+- **Cryptographic agility foundation.** Address derivation and signature verification now accept an optional scheme identifier, defaulting to ML-DSA-44 and reproducing the original address formula byte-for-byte (proven, not assumed). Nothing uses anything but the default yet — this only ensures a second scheme could be added later without a new genesis or breaking a single existing address. See `MATH_SPEC.md` §0.
 
 We document what actually broke and how it got fixed, not just what works when nothing goes wrong.
 
@@ -74,10 +75,12 @@ Handles system dependencies, builds liboqs (version-pinned for confirmed compati
 
 There's one manual, deliberate first step, then it's automatic — the same pattern Bitcoin (DNS seeds, then `addr` messages) and Ethereum (bootnodes, then Kademlia) both use. See `MATH_SPEC.md` §12a for the exact formulas.
 
-1. Email us (see below) and we'll give you the address of at least one existing trusted node.
-2. Your new node points at it (`PEER_URLS`) and can immediately start syncing the chain.
+As of v5.41, `install.sh` asks for peer addresses interactively and stores them as systemd environment variables (`BIOCHAIN_PEER_URLS`, `BIOCHAIN_SELF_URL`) — `biochain.py` itself is never edited. Leaving the peer prompt blank falls back to `DEFAULT_BOOTSTRAP_PEERS`, a small, known-good seed list baked into the code (currently both production nodes) — the same role Bitcoin's DNS seeds and Ethereum's bootnodes play, and, like those, a list that may need updating in a future release as the network's real, trusted membership changes.
+
+1. Run `install.sh` — for the two current production nodes, leaving the peer prompt blank is enough; it uses `DEFAULT_BOOTSTRAP_PEERS` automatically. To point at a different node instead (or if the defaults are ever retired), email us (see below) for a current address.
+2. Your new node immediately starts syncing the chain from whichever peer(s) it's pointed at.
 3. Your node calls `POST /peer/announce` on that existing node — a basic liveness check runs, then it becomes a visible candidate. This alone grants no trust.
-4. Once a strict majority of the existing trust set independently confirms your node through their own gossip with each other (not through anything you say about yourself), it's durably promoted into their `PEER_URLS` — automatically, no further manual step, and it survives restarts.
+4. Once a strict majority of the existing trust set independently confirms your node through their own gossip with each other (not through anything you say about yourself), it's durably promoted into their trusted-peer list — automatically, no further manual step, and it survives restarts.
 
 Node emergence itself (an address becoming a live, voting participant after sending impulses) has always been fully automatic and requires no introduction from anyone — see §6 in `MATH_SPEC.md` for the Sybil-resistance timing requirement added to that specific mechanism.
 

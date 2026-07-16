@@ -6,6 +6,27 @@ All monetary values are integers in **satoshis** (`sat`). `1 BIO = 10^8 sat`. Th
 
 ---
 
+## 0. Signature Scheme and Address Derivation
+
+```
+address(pk) = "BIO1" + SHA3-256(pk)[:16].upper()
+```
+
+Every address that has ever existed on BioChain is ML-DSA-44 (CRYSTALS-Dilithium3, FIPS 204) — no ECDSA fallback, no hybrid mode. This is a deliberate choice, not a temporary one: ML-DSA is already fully NIST-standardized (unlike newer, still-evolving candidates such as FAEST or HAWK), and matches the actual production posture of the largest, best-resourced blockchain PQ migration effort in the industry (Ethereum's own accounts remain on classical ECDSA as of this writing — see the Whitepaper §3.2e for the full comparison).
+
+**Cryptographic agility foundation (v5.40):**
+
+```
+address(pk, scheme_id="MLDSA44") = "BIO1" + SHA3-256(pk)[:16].upper()          -- unchanged formula
+address(pk, scheme_id=X≠"MLDSA44") = "BIO1" + SHA3-256(X + pk)[:16].upper()    -- any future scheme
+```
+
+`scheme_id` defaults to `"MLDSA44"` everywhere it is not explicitly passed, so every address ever created continues to resolve identically — this is proven by direct byte-for-byte comparison against the original formula in the regression suite, not merely assumed. A future scheme's `scheme_id` is folded into the hash, guaranteeing no address collision with an ML-DSA-44 address is possible even given identical raw key bytes.
+
+This lays groundwork only — no wallet, API endpoint, or verification path currently passes anything other than the default. Adding a second scheme later (a hash-based candidate such as SLH-DSA/FIPS 205 is the most likely candidate, chosen specifically for its security assumption being mathematically independent of ML-DSA's lattice-based one — see Whitepaper §3.2e for the full reasoning) would require wiring `scheme_id` through the relevant endpoints and a new `wallets.sig_scheme` column value for opted-in wallets, but never a new genesis and never breaking a single existing address.
+
+---
+
 ## 1. Supply Invariant
 
 At every block, the following must hold as **exact integer equality**:
@@ -356,6 +377,8 @@ confirmations(url) ≥ promotion_threshold   AND   url ≠ SELF_URL
 ```
 
 The `SELF_URL ≠ url` condition excludes this node's own configured public address from ever being treated as a candidate: any peer that trusts this node back will naturally list this node's own address among its trusted peers during gossip, which would otherwise be indistinguishable from a genuine third-party recommendation.
+
+*(v5.41: `SELF_URL` and the initial trusted-peer set are read from environment variables (`BIOCHAIN_SELF_URL`, `BIOCHAIN_PEER_URLS`) at process start, not hardcoded in `biochain.py` — see `DEFAULT_BOOTSTRAP_PEERS` for the fallback used when `BIOCHAIN_PEER_URLS` is unset. The formulas above are unaffected by this — only where the values originate from changed.)*
 
 Because the threshold is a strict majority of the *current* trust set, the cost of forging enough confirming peers to force a false promotion grows with the network — at 2 trusted peers both must independently confirm; at 10 peers, 6 must. Stale candidates unconfirmed for `7` days are pruned automatically.
 
