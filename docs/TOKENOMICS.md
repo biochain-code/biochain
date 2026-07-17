@@ -140,21 +140,33 @@ founder_grant = min(10,000 BIO, remaining genesis pool balance)
 
 **c) Wallet-registration pool carve-out** — see §8 below; 1,000 BIO of the founder's own starting balance (from item b) is immediately moved out into a separate pool at first boot, not drawn from `genesis` directly a second time.
 
-**d) Developer-grants pool carve-out (v5.40)** — see §6a below; 509,000 BIO moved directly out of `genesis` into a dedicated pool at first boot, funding real-world builders instead of sitting as an undocumented, unspent remainder.
+**d) Developer-grants pool carve-out (v5.40)** — see §6a/§6b below; 509,000 BIO moved directly out of `genesis` into a dedicated pool at first boot, funding real-world builders instead of sitting as an undocumented, unspent remainder. As of v5.41, that single pool is itself split evenly in two: developer grants (§6a) and server-operator grants (§6b) — the genesis-time carve-out amount is unchanged, only its internal split is new.
 
 Adding up all four: `300,000 (max genesis grants) + 10,000 (founder) + 1,000 (wallet registration) + 509,000 (developer grants) = 820,000` — the genesis pool's full allocation, exactly, none of it unaccounted for.
 
 ---
 
-## 6a. `developer_grants` — 509,000 BIO (funded from the genesis pool's remainder, not a new top-level allocation)
+## 6a. `developer_grants` — 254,500 BIO (half of the original 509,000 pool; see §6b for the other half)
 
-**Spends on:** grants for real-world builders — wallets, block explorers, SDKs, integrations — anything extending the network beyond the core protocol. Added in v5.40 after external review flagged this remainder as undocumented and unusable in earlier versions of this document.
+**Spends on:** grants for real-world builders — wallets, block explorers, SDKs, integrations — anything extending the network beyond the core protocol. Added in v5.40 after external review flagged this remainder as undocumented and unusable in earlier versions of this document. As of v5.41, the original 509,000 BIO pool is split evenly, once, at first boot — this half keeps its original purpose unchanged.
 
 ```
 grant = clamp(proposed_amount, 1 BIO, 5,000 BIO), voted per grant via governance proposal
 ```
 
 Same voted-amount pattern as `listing_reserve` below — requires a full governance proposal and vote, amount decided case by case, never a flat automatic rate. Every grant is recorded in a dedicated table (recipient address, project name, description, amount, proposal ID) for public auditability.
+
+---
+
+## 6b. `server_rewards` — 254,500 BIO (the other half of the original 509,000 pool, added v5.41)
+
+**Spends on:** grants to independent server operators — anyone standing up and maintaining a genuinely separate, publicly reachable BioChain node.
+
+```
+grant = clamp(proposed_amount, 1 BIO, 2,000 BIO), voted per grant via governance proposal
+```
+
+An earlier internal design paid this automatically once a server had been continuously confirmed as a trusted peer by other nodes for 365 days, tracked in a node-local table. That design was replaced before ever reaching production: two independently-operated nodes can legitimately disagree about exactly when a given peer was first trusted, so the identical payout claim could be valid on one server and rejected by another — a genuine chain-split hazard. Moving the payout to the same governance vote already used for developer grants removes that hazard entirely: the tally is built only from votes recorded on the chain itself, identical on every node by construction. There is no automatic uptime or liveness check inside consensus — voters see the server's claimed history in the proposal description and judge its credibility themselves, exactly like every other discretionary grant on this network. Every grant is recorded in a dedicated, publicly auditable table (recipient address, server URL, amount, proposal ID).
 
 ---
 
@@ -198,6 +210,7 @@ Requires a real signed transaction (`REGISTER`) from the receiving address — a
 | Wallet-registration grant | First 100 real registrations | No — pure formula |
 | Listing reward | Confirmed exchange listing | **Yes** — amount decided per governance vote |
 | Developer grant | Governance proposal | **Yes** — amount decided per governance vote, always |
+| Server-operator grant | Governance proposal | **Yes** — amount decided per governance vote, always |
 | Partial fee burning | Every transaction fee | No — pure formula, but rate is **0% at launch** by founder decision |
 
-Of ten active spending/burning mechanisms, eight are pure, hard-coded formulas with no human discretion at all. Two require a full governance proposal and vote, not a unilateral decision by anyone, including the founder: listing rewards and developer grants.
+Of eleven active spending/burning mechanisms, eight are pure, hard-coded formulas with no human discretion at all. Three require a full governance proposal and vote, not a unilateral decision by anyone, including the founder: listing rewards, developer grants, and server-operator grants.

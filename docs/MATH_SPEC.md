@@ -67,7 +67,7 @@ The six categories above sum to exactly `21,000,000 BIO` — no unassigned remai
 |---|---|---|
 | Founder's starting operating balance | 10,000 | Once, at genesis |
 | Wallet-registration grant pool (§3a) | 1,000 | Once, carved from the founder's own balance |
-| Developer-grants pool (§3b) | 509,000 | Once, moved out of `pool_genesis` directly |
+| Developer + server-operator grants pool (§3b/§3c) | 509,000 | Once, moved out of `pool_genesis` directly; split 254,500/254,500 in v5.41 |
 | Remaining for tiered genesis grants (§3) | up to 300,000 | Ongoing, as new addresses qualify |
 
 `10,000 + 1,000 + 509,000 + 300,000 = 820,000` — exactly the genesis pool's full allocation, none of it unaccounted for.
@@ -148,9 +148,13 @@ Requires a real signed impulse (`kind = REGISTER`), not a passive balance check 
 ## 3b. Developer Grants Pool
 
 ```
-DEVELOPER_GRANTS_POOL_SIZE = 509,000 BIO   -- moved out of pool_genesis
-                                            once, at first boot
-DEVELOPER_GRANT_MAX        = 5,000 BIO     -- ceiling per single grant
+DEVELOPER_GRANTS_POOL_SIZE_V41 = 254,500 BIO  -- half of the original
+                                               -- 509,000 BIO pool; the
+                                               -- other half became
+                                               -- server_rewards (§3c),
+                                               -- split once at first
+                                               -- boot, v5.41
+DEVELOPER_GRANT_MAX             = 5,000 BIO   -- ceiling per single grant
 ```
 
 Funds real-world builders (wallets, block explorers, SDKs, integrations) from the genesis pool's remainder, which had no spending path in earlier versions of this document. Released only via governance proposal — same voted-amount pattern as the listing reward in §9, clamped to `[1 .. DEVELOPER_GRANT_MAX]` BIO, never a flat rate:
@@ -158,6 +162,27 @@ Funds real-world builders (wallets, block explorers, SDKs, integrations) from th
 ```
 grant_developer(proposed_amount) = clamp(proposed_amount, 1 BIO, 5,000 BIO)
 ```
+
+## 3c. Server-Operator Grants Pool (split from developer grants, v5.41; governance-only payout, v5.42)
+
+```
+SERVER_REWARDS_POOL_SIZE = 254,500 BIO  -- exactly half of the original
+                                         -- 509,000 BIO developer-grants
+                                         -- pool, moved out of it once
+                                         -- at first boot (a migration,
+                                         -- not a fresh genesis carve)
+SERVER_REWARD_MAX        = 2,000 BIO    -- ceiling per single grant
+```
+
+Funds grants to independent server operators — anyone standing up and maintaining a genuinely separate, publicly reachable BioChain node. Released only via governance proposal, same voted-amount pattern as §3b, clamped to `[1 .. SERVER_REWARD_MAX]` BIO:
+
+```
+grant_server(proposed_amount) = clamp(proposed_amount, 1 BIO, 2,000 BIO)
+```
+
+**Why governance-only, not automatic (v5.42 redesign):** an earlier design paid this reward automatically once a server had been continuously confirmed as a trusted peer by other nodes for 365 days, tracked in a node-local table (`promoted_peers`). That design was replaced before reaching production: two independently-operated nodes can legitimately disagree about exactly when a given peer was first trusted, so the identical payout claim could be valid on one server and rejected by another — a genuine chain-split hazard, not a hypothetical one. A node's validity must depend only on the chain itself, never on any one node's private bookkeeping about who it happens to trust. Governance tally is built only from votes recorded on the chain, identical on every node by construction, which removes the hazard entirely.
+
+Idempotency (no double-payout for the same server) is enforced by a dedicated ledger keyed on server URL, populated only by successful governance-approved grants — itself chain-derived, not node-local state.
 
 Every grant is recorded in a dedicated ledger table (address, project name, description, amount, proposal ID) for public auditability — anyone can verify exactly what every BIO from this pool funded and which governance proposal authorized it.
 
