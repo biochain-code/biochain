@@ -15,7 +15,7 @@ A post-quantum Layer-1 blockchain where nodes are not registered or deployed —
 - **Integer money, no exceptions.** All monetary values are satoshi-scale integers. The supply invariant (`wallets + pools + locked + staked == 21,000,000 BIO`) is checked with exact equality, not tolerance — any drift of even one satoshi is a bug, not a rounding error.
 - **Custody-free atomic swaps.** HTLC-based swaps (`SWAP_OFFER` / `SWAP_LOCK` / `SWAP_CLAIM` / `SWAP_REFUND`) between BIO and any external asset, with `want_asset` as free text — no hardcoded whitelist tying the protocol to any single external chain.
 - **State checkpoints.** New nodes can adopt a hash-verified snapshot instead of replaying the full chain from genesis, with automatic fallback to full replay on any hash mismatch.
-- **liboqs (C) signature backend.** ~267x faster ML-DSA-44 verification than the pure-Python reference implementation, measured on real production hardware — ~53,500 verifies/sec.
+- **liboqs (C) signature backend.** ~228x faster ML-DSA-44 verification than the pure-Python reference implementation, measured on real production hardware — ~44,365 verifies/sec.
 
 ## Real-world validation, not just a test suite
 
