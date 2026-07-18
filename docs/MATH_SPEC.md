@@ -25,7 +25,20 @@ address(pk, scheme_id=X≠"MLDSA44") = "BIO1" + SHA3-256(X + pk)[:16].upper()   
 
 This lays groundwork only — no wallet, API endpoint, or verification path currently passes anything other than the default. Adding a second scheme later (a hash-based candidate such as SLH-DSA/FIPS 205 would be the most independent choice, chosen specifically for its security assumption being mathematically unrelated to ML-DSA's lattice-based one) would require wiring `scheme_id` through the relevant endpoints and a new `wallets.sig_scheme` column value for opted-in wallets, but never a new genesis and never breaking a single existing address.
 
-**ML-DSA-65 explored (July 2026):** the foundation above was exercised end to end against ML-DSA-65 (same lattice family as ML-DSA-44, one security level up) as an isolated, throwaway test fork in a Ubuntu environment -- real liboqs backend, freshly built from source, not a simulation. Full correctness confirmed (tamper rejection, wrong-key rejection, address derivation all behave correctly) and real hardware figures measured directly: public key +49% (1,312 to 1,952 B), signature +37% (2,420 to 3,309 B), verification throughput -37% (10,373 to 6,527 verify/sec) -- see Whitepaper §3.2e for the full write-up. No production code was changed and no address format was altered — this was deliberately kept a same-family security-margin exercise, not the cross-family diversification the paragraph above describes, and remains unactivated pending an actual governance decision rather than mere technical readiness.
+**ML-DSA-65 and ML-DSA-87 explored (July 2026):** the foundation above was exercised end to end against both ML-DSA-65 and ML-DSA-87 (same lattice family as ML-DSA-44, one and two security levels up respectively) as isolated, throwaway test forks in a Ubuntu environment -- real liboqs backend, freshly built from source, not a simulation. Both forks confirmed full correctness (tamper rejection, wrong-key rejection, address derivation all behave correctly) and real hardware figures were measured directly, all three levels in one run for a fair comparison:
+
+```
+                    ML-DSA-44      ML-DSA-65      ML-DSA-87
+public key          1,312 B        1,952 B        2,592 B
+signature           2,420 B        3,309 B        4,627 B
+verify/sec          10,469         6,845          4,240
+
+relative to ML-DSA-44:
+  ML-DSA-65:  key 1.49x, signature 1.37x, verify 0.65x speed
+  ML-DSA-87:  key 1.98x, signature 1.91x, verify 0.40x speed
+```
+
+See Whitepaper §3.2e for the full write-up, including why the security-margin gain is exponential even though this cost is linear. No production code was changed and no address format was altered for either exercise — both were deliberately kept same-family security-margin exercises, not the cross-family diversification the paragraph above describes, and remain unactivated pending an actual governance decision rather than mere technical readiness.
 
 ---
 
