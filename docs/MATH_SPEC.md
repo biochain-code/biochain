@@ -12,7 +12,7 @@ All monetary values are integers in **satoshis** (`sat`). `1 BIO = 10^8 sat`. Th
 address(pk) = "BIO1" + SHA3-256(pk)[:16].upper()
 ```
 
-Every address that has ever existed on BioChain is ML-DSA-44 (CRYSTALS-Dilithium3, FIPS 204) — no ECDSA fallback, no hybrid mode. This is a deliberate choice, not a temporary one: ML-DSA is already fully NIST-standardized (unlike newer, still-evolving candidates such as FAEST or HAWK), and matches the actual production posture of the largest, best-resourced blockchain PQ migration effort in the industry (Ethereum's own accounts remain on classical ECDSA as of this writing — see the Whitepaper §3.2e for the full comparison).
+Every address that has ever existed on BioChain is ML-DSA-44 (CRYSTALS-Dilithium3, FIPS 204) — no ECDSA fallback, no hybrid mode. This is a deliberate choice, not a temporary one: ML-DSA is already fully NIST-standardized, unlike newer, still-evolving candidates such as FAEST or HAWK.
 
 **Cryptographic agility foundation (v5.40):**
 
@@ -292,6 +292,54 @@ A node with `alive(t) = false` for `365` consecutive days has its balance swept:
 ```
 balance(a) → pool_ecosystem,   if dead for 365 days with no rebirth
 ```
+
+## 6a. Node Roles
+
+```
+ROLES = {VALIDATOR, KEEPER, ROUTER}
+role(a) = random choice from ROLES, assigned once at emergence
+```
+
+**Naming collision, stated explicitly to prevent confusion:** `VALIDATOR` is also the name of a stake tier (§8). A node's role and its stake tier are two completely independent axes, assigned by entirely different mechanisms (role: random at birth; tier: deterministic function of staked BIO) -- a node with role `ROUTER` and stake tier `ANCHOR_VALIDATOR` is a normal, valid combination. The shared word is coincidental, not a relationship. Confirmed live on the production network: the founder's own node currently holds role `ROUTER` and stake tier `NONE` simultaneously (`GET /validators`).
+
+**Rebirth:** if a previously-dead address is reborn, it has a deterministic ~30% chance of inheriting its prior role instead of drawing a new one:
+
+```
+seed = SHA-256(address + births)
+inherit_role ⟺ (seed mod 100) < 30
+```
+
+Deterministic, not `random.random()` -- this runs inside consensus-critical code, and every node on the network must compute the identical outcome independently, the same principle behind every other decision in this document.
+
+```
+ROLE_BONUS = {
+    VALIDATOR: {energy: 1.0, reputation: 0.02},
+    KEEPER:    {energy: 2.0, reputation: 0.01},
+    ROUTER:    {energy: 0.5, reputation: 0.01},
+}
+```
+
+On every impulse sent:
+
+```
+energy(t+1)     = energy(t) + ENERGY_PER_IMPULSE × ROLE_BONUS[role].energy + 0.1 × value_bio
+reputation(t+1) = min( reputation(t) + ROLE_BONUS[role].reputation, 10.0 )
+```
+
+**Role's only downstream effect** is through this energy/reputation growth rate. Role does not appear directly in validator selection (§3.2b of the Whitepaper), block reward size, or governance vote weight (§9). It reaches exactly one further place -- the block-finalization weight check:
+
+```
+weight(node) = (recent_activity × 1.0 + reputation × 2.0 + energy × 3.0)
+               × (liquidity / (1 + risk)) × stake_tier_weight_mult
+
+can_finalize = stability > THETA_S  AND  weight(validator) > THETA_W  AND  impulse.energy < THETA_I
+
+THETA_S = 0.15   THETA_W = 5.0 (default, governable)   THETA_I = 80.0
+```
+
+Since `reputation` and `energy` both feed `weight` directly, and both grow at a role-dependent rate, a node's role indirectly affects how quickly it clears `THETA_W` at a given level of activity -- `KEEPER` fastest on energy (2x growth), `VALIDATOR` fastest on reputation specifically, `ROUTER` slowest on both. This is the only chain by which role reaches consensus-relevant code.
+
+**If the selected validator fails this check**, the block is not rejected -- the impulse falls back to bootstrap-mode processing (the same path used before any node has emerged) rather than being hard-rejected. Deterministic validator selection (§3.2b of the Whitepaper) is unaffected by role; this check only gates whether the selected validator's block clears normally or falls back.
 
 ## 7. Longevity Rewards
 
