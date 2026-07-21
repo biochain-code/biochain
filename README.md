@@ -88,7 +88,9 @@ Node emergence itself (an address becoming a live, voting participant after send
 
 ## Access
 
-This repository is currently private. We're not hiding the project out of secrecy — we're being deliberate about the order of operations: real decentralization (multiple independently-operated nodes) and a legal review of the project's regulatory position should both be further along before a fully public launch, not after.
+This repository is public. Two things from the paragraph that used to be here are still true, and still worth saying plainly rather than dropping quietly: real decentralization (multiple independently-operated nodes) and a legal review of the project's regulatory position are both still ahead, not behind. Going public now is a deliberate choice to get real engineering feedback and find independent node operators — not a claim that either of those is finished.
+
+**Try the wallet:** [biochainnetwork.com](https://biochainnetwork.com) or [node2.biochainnetwork.com](https://node2.biochainnetwork.com) — both production nodes serve the same wallet, backed by the same live chain.
 
 If you're interested in:
 - running a node
