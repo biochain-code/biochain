@@ -28,6 +28,7 @@ This isn't a whitepaper-only design. As of the current release:
 - **Developer grants.** 254,500 BIO fund real-world builders (wallets, explorers, SDKs, integrations), released only via governance vote, capped at 5,000 BIO per grant.
 - **Server-operator grants.** 254,500 BIO fund independent node operators, released only via governance vote, capped at 2,000 BIO per grant — the other half of the original 509,000 BIO pool, split in v5.41.
 - **Cryptographic agility foundation.** Address derivation and signature verification now accept an optional scheme identifier, defaulting to ML-DSA-44 and reproducing the original address formula byte-for-byte (proven, not assumed). Nothing uses anything but the default yet — this only ensures a second scheme could be added later without a new genesis or breaking a single existing address. See `MATH_SPEC.md` §0.
+- **Performance rework for scale (v5.43).** Eight targeted fixes -- validator-selection caching, event-driven node death via a heap instead of a per-block sweep, lazy energy decay, `/verify` integrity caching, batched balance rollback, lazy cold storage for blocks outside a 50,000-block hot window, periodic WAL checkpointing, and a newly-governable flat transfer fee -- deployed to both production nodes July 21, 2026. Seven of the eight change no formula, only computation strategy. Full detail and an honest per-fix confirmation status (production-hardware-tested vs. sandbox-only) in `MATH_SPEC.md` §14.
 
 We document what actually broke and how it got fixed, not just what works when nothing goes wrong.
 

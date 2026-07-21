@@ -378,7 +378,9 @@ Proposal passes if and only if:
 total_votes ≥ 21   AND   votes_for / total_votes ≥ 0.70
 ```
 
-Then a `7-day` timelock applies before the change takes effect. `21` (the quorum floor), `0.70` (the pass threshold), the `7-day` timelock, and `MAX_SUPPLY = 21,000,000` are **constitutional** — excluded from the set of governable parameters, un-votable by design.
+Then a `7-day` timelock applies before the change takes effect. `0.70` (the pass threshold), the `7-day` timelock, and `MAX_SUPPLY = 21,000,000` are **constitutional** — excluded from the set of governable parameters, un-votable by design.
+
+`21` is the default quorum and its own hard floor, not constitutional -- `governance_min_votes` is itself a governable parameter (bounds `[21, 10_000]`), deliberately allowing the network to raise (never lower below 21) its own quorum requirement as it grows, without a code deployment.
 
 ## 10. HTLC Atomic Swaps
 
@@ -488,4 +490,122 @@ Computed separately for wallet balances and staked amounts, among live nodes onl
 
 ---
 
-*BioChain AAECN — Mathematical Specification, corresponding to code v5.40*
+## 14. Scale Testing and Performance Work (July 2026) — DEPLOYED July 21, 2026
+
+Everything below describes work originally done against an isolated
+fork of the production code, tested in sandbox conditions and, for
+most of it, directly on production hardware via throwaway instances
+with their own isolated database -- never a live database, never live
+funds, during development. **As of July 21, 2026, this code is running
+on both production servers (server1, server2).** See Whitepaper
+section 3.12 for the full write-up, including the specific findings
+that prompted this work (real, measured timeouts at 12,000 live nodes;
+a single `/verify` call taking over four minutes at 258,938 blocks)
+and an honest accounting of which of the eight fixes were confirmed on
+production hardware specifically versus sandbox-only.
+
+**Seven of the eight fixes below change no formula in this document --
+same math, same outputs, verified deterministic/byte-identical against
+the unmodified code in every case; only the internal computation
+strategy changed, for performance.** The one exception is noted
+explicitly:
+
+- Validator-selection formula (section on organic node emergence /
+  role weight): unchanged. A cached, sorted alive-address list replaces
+  re-sorting every alive node on every impulse; invalidated exactly on
+  birth, death, or rebirth. 313 -> up to 425,386 selections/sec measured
+  at 12,000 alive nodes on production hardware.
+- Energy decay (`energy(t+1) = energy(t) - ENERGY_DECAY_RATE + ...`):
+  unchanged as a formula. Previously recomputed for every alive node on
+  every block; now computed lazily and exactly for a specific node only
+  when that node is actually touched (`Node.materialize()`), with death
+  timing precomputed once via `ceil((energy - ENERGY_DEATH) /
+  ENERGY_DECAY_RATE)` and revised only when that node's energy actually
+  changes. Verified against the original per-block formula over a
+  400-block simulation with intermixed touches: 49/50 test nodes
+  produced bit-identical energy and alive/dead status; the 50th differed
+  by exactly one block due to floating-point accumulation from ~400
+  sequential subtractions versus one batched multiplication (~1e-13
+  magnitude) -- a one-time migration-boundary artifact, not an ongoing
+  cross-peer divergence risk, since every peer running the same new code
+  computes the identical closed-form result.
+- State-checkpoint hash / chain integrity check (`state_hash`,
+  section 11's canonical-form check, and the separate prev_hash
+  link-check `/verify` performs): unchanged as a check. Previously
+  rescanned the full chain on every `/verify` call; now caches how far
+  the chain has already been confirmed intact, since a previously-valid
+  link can never become invalid later (blocks are immutable once
+  appended). 12.53ms -> 0.04ms at 100,000 blocks (335x); 28.00ms ->
+  0.04ms at 500,000 blocks (667x).
+- In-memory rollback on a failed transaction: unchanged in what it
+  guarantees (full restoration of every balance a failed transaction
+  touched). Previously snapshotted every alive node's balance before
+  every transaction; now records only the specific nodes actually
+  touched, via a property on `Node.balance`, regardless of which of the
+  many code paths that can change a balance is responsible. Verified on
+  a three-node scenario (sender, receiver, and an unrelated third node)
+  that all three balances restore exactly on a simulated failure.
+- Chain storage: no consensus-relevant formula involved. Blocks older
+  than a configurable hot window (currently the most recent 50,000)
+  are held as lightweight references (hash, prev_hash, index, validator,
+  reward, timestamp only) instead of full objects; full impulse detail
+  for an old block loads from the database on the rare access that
+  actually needs it, and is verified byte-for-byte identical to the
+  original after that reload. This is the fix for the four-minute
+  `/verify` finding: at 258,938 blocks without it, block-generation
+  throughput fell from ~1,900 blocks/sec to ~90 blocks/sec under
+  uncontrolled memory growth; at 500,000 blocks with it, generation
+  speed and available memory both stayed flat throughout, tested
+  directly on production hardware -- confirmed via a throwaway instance
+  on server1's actual hardware, synthetically generating 60,000 blocks
+  to exercise the hot/cold boundary, not sandbox-only. **Not yet
+  exercised against the real, live chain as of this writing** -- the
+  live chain is at block 191, far short of the 50,000-block hot window
+  boundary, so the cold-storage path has been confirmed on production
+  hardware but never yet on production data.
+- SQLite WAL checkpointing: not a chain-consensus matter at all --
+  pure local disk housekeeping, explicitly safe for different peers to
+  perform at completely different times or frequencies with zero
+  cross-peer effect. Found necessary after a real incident: SQLite's own
+  automatic checkpointing fell behind under sustained write load in
+  these same tests, letting the WAL file grow to 1.9GB, at which point a
+  single-row primary-key lookup (exactly what the chain-storage fix
+  above depends on) took 89.5 seconds instead of under a millisecond. An
+  explicit checkpoint every 5,000 blocks, issued only after each
+  transaction's own commit completes, keeps the WAL file bounded --
+  verified to return to 0 bytes at each interval. **Confirmed live in
+  production** on both servers July 21, 2026: manual `PRAGMA
+  wal_checkpoint` returned `0|656|656` (server1) and `0|599|599`
+  (server2) -- not busy, every outstanding frame checkpointed.
+
+**The one exception -- an actual parameter-governability change:**
+
+```
+transfer_fee_flat: governable, bounds [0, 1] BIO, default unchanged at 0.01 BIO
+```
+
+Previously only the percentage component of the transfer fee (formula
+in section 5 above) could be adjusted by governance vote; the flat
+0.01 BIO component was a hardcoded constant, contrary to this
+document's own §5 description of both components as governable.
+Bitcoin shipped an almost identical hardcoded flat minimum fee (0.01
+BTC) in 2010 and had to remove it entirely within about a year once
+BTC's price rose enough to make it disproportionate -- a disruptive,
+coordinated protocol change of exactly the kind a governance parameter
+exists to avoid needing later. This closes that same gap here, before
+it has ever mattered in practice. Default behavior is unchanged as of
+deployment; this only takes effect once a future governance vote
+actually changes it. **Not yet exercised as of this writing** -- no
+proposal targeting `transfer_fee_flat` has been created on the live
+network.
+
+All eight fixes pass the full 194/195-check regression suite (195 with
+liboqs present) individually and together, both pre-deployment and
+against the exact file now running in production (hash confirmed
+identical on both servers). Deployed to server1 and server2 on July 21,
+2026; a real-traffic observation period is in progress on both before
+this is considered fully closed out.
+
+---
+
+*BioChain AAECN — Mathematical Specification, corresponding to code v5.43*

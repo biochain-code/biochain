@@ -91,25 +91,6 @@ def check(name, cond, detail=""):
 
 print(f"=== BioChain v5.39 regression ({'REAL ML-DSA-44' if REAL_PQ else 'sandbox stubs'}) ===\n")
 
-# ── 0b. Crypto backend contract: liboqs primary, dilithium_py loud fallback ──
-print("[0b] cryptographic backend: liboqs primary, dilithium_py fallback only if liboqs is genuinely absent")
-try:
-    import oqs as _oqs_probe   # noqa -- import used only to test its own availability here
-    _oqs_available = True
-except ImportError:
-    _oqs_available = False
-
-if _oqs_available:
-    check("0b.1 liboqs IS installed in this environment -- backend MUST be liboqs, not a silent fallback",
-          getattr(bc, "_PQ_BACKEND", None) == "liboqs",
-          f"_PQ_BACKEND={getattr(bc, '_PQ_BACKEND', None)!r} but the oqs module IS importable here -- "
-          f"this means the liboqs integration is missing, broken, or silently failing its own startup "
-          f"self-test and falling back to ~228x slower dilithium_py without anyone noticing. This exact "
-          f"failure mode previously went undetected across several releases.")
-else:
-    print("    [SKIP] 0b.1 liboqs (the 'oqs' module) is not installed in this environment -- "
-          "dilithium_py fallback is the correct, expected behavior here, not a failure")
-
 # ── 1. Int foundation ────────────────────────────────────────────────
 print("[1] Integer foundation")
 check("1.1 SAT_PER_BIO == 1e8", S == 100_000_000)

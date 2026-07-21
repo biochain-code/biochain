@@ -63,7 +63,7 @@ echo "[2/7] Building liboqs v${LIBOQS_VERSION} (C library, ~2-3 minutes)..."
 if [ -d "$HOME/liboqs" ]; then
     echo "      ~/liboqs already exists, skipping clone"
 else
-    git clone --branch "v${LIBOQS_VERSION}" --depth 1 \
+    git clone --branch "${LIBOQS_VERSION}" --depth 1 \
         https://github.com/open-quantum-safe/liboqs.git "$HOME/liboqs" -q
 fi
 mkdir -p "$HOME/liboqs/build"

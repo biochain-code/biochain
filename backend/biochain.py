@@ -8,9 +8,10 @@ import threading
 import sqlite3
 import os
 import secrets
+import heapq
+import math
 from contextlib import contextmanager
-import copy  # not strictly required yet, but useful if node snapshots
-             # ever need a real deepcopy instead of a shallow one
+import copy
 
 try:
     import requests as http_requests
@@ -24,22 +25,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-# ORGANIC GROWTH CONSTANTS
-EMERGE_THRESHOLD    = 21    # impulses required for a node to be born
+EMERGE_THRESHOLD    = 21
 
-MIN_EMERGENCE_SPAN_SECONDS = 7 * 86400   # Sybil-resistance for node
-ENERGY_PER_IMPULSE  = 8.0   # energy gained per impulse sent
-ENERGY_DECAY_RATE   = 0.02  # energy lost per block
-ENERGY_DEATH        = 5.0   # node dies below this energy level
-REBIRTH_THRESHOLD   = EMERGE_THRESHOLD  # same threshold for rebirth
+MIN_EMERGENCE_SPAN_SECONDS = 7 * 86400
+ENERGY_PER_IMPULSE  = 8.0
+ENERGY_DECAY_RATE   = 0.02
+ENERGY_DEATH        = 5.0
+RECENT_ACTIVITY_DECAY = 0.95
+CHAIN_HOT_WINDOW = 50_000
+REBIRTH_THRESHOLD   = EMERGE_THRESHOLD
 
-# TEAM -- 5% VESTING
-TEAM_ADDRESS    = "BIO139339DE8FA694295"   # developer address -- real wallet, real ML-DSA-44 key
+TEAM_ADDRESS    = "BIO139339DE8FA694295"
 SAT_PER_BIO = 100_000_000
 
 def bio_to_sat(amount) -> int:
     """Boundary IN: parse a BIO amount (float/str/int) into int sats."""
-    s = f"{float(amount):.8f}"          # the canonical signed form
+    s = f"{float(amount):.8f}"
     neg = s.startswith("-")
     if neg: s = s[1:]
     whole, frac = s.split(".")
@@ -61,20 +62,17 @@ def transfer_fee(value_sat: int) -> int:
     """THE canonical transfer fee, in sats -- flat base + PPM share, pure integer, floor rounding."""
     return Emission.TRANSFER_FEE_BASE + (value_sat * Emission.BURN_RATE_PPM) // 1_000_000
 
-VALIDATORS_POOL_GENESIS = 8_400_000 * SAT_PER_BIO   # fixed reference point
-VALIDATORS_TAPER_PERCENT = 10   # below this % of genesis size
-# block reward tapers linearly toward zero
+VALIDATORS_POOL_GENESIS = 8_400_000 * SAT_PER_BIO
+VALIDATORS_TAPER_PERCENT = 10
 VALIDATORS_TAPER_FLOOR = VALIDATORS_POOL_GENESIS * VALIDATORS_TAPER_PERCENT // 100
 
-TEAM_POOL_TOTAL = 1_050_000 * SAT_PER_BIO   # 5% of 21M (sats)
-VESTING_MONTHS  = 114                       # payout months 7-120
-CLIFF_SECONDS   = 6  * 30 * 24 * 3600      # 6 month cliff -- unchanged
-MONTH_SECONDS   = 30 * 24 * 3600           # 1 month
-# Integer vesting: TEAM_POOL_TOTAL (sats) does not divide evenly by
-MONTHLY_PAYOUT       = TEAM_POOL_TOTAL // VESTING_MONTHS          # sats, months 1..(N-1)
+TEAM_POOL_TOTAL = 1_050_000 * SAT_PER_BIO
+VESTING_MONTHS  = 114
+CLIFF_SECONDS   = 6  * 30 * 24 * 3600
+MONTH_SECONDS   = 30 * 24 * 3600
+MONTHLY_PAYOUT       = TEAM_POOL_TOTAL // VESTING_MONTHS
 FINAL_MONTH_PAYOUT   = TEAM_POOL_TOTAL - MONTHLY_PAYOUT * (VESTING_MONTHS - 1)
 
-# BIO STAKE -- VALIDATOR TIERS
 STAKE_TIERS = {
     "NONE":             {"min_bio": 0,                          "reward_mult": 1.0, "weight_mult": 1.0, "label": "No stake"},
     "VALIDATOR":        {"min_bio": 1_000  * 100_000_000,      "reward_mult": 1.0, "weight_mult": 1.0, "label": "Validator"},
@@ -83,82 +81,67 @@ STAKE_TIERS = {
 }
 
 def get_tier(bio_amount: int) -> str:
-    # bio_amount in SATS 
     """Reads thresholds FROM STAKE_TIERS, not from hardcoded numbers."""
     if bio_amount >= STAKE_TIERS["ANCHOR_VALIDATOR"]["min_bio"]: return "ANCHOR_VALIDATOR"
     if bio_amount >= STAKE_TIERS["SENIOR_VALIDATOR"]["min_bio"]: return "SENIOR_VALIDATOR"
     if bio_amount >= STAKE_TIERS["VALIDATOR"]["min_bio"]:        return "VALIDATOR"
     return "NONE"
 
-# NETWORK SAFEGUARDS
-GOVERNANCE_THRESHOLD = 0.70          # 70% needed to pass a proposal
-GOVERNANCE_MIN_VOTES = 21            # fixed absolute minimum, not a percentage
-GOVERNANCE_TIMELOCK  = 7 * 86400     # 7 days before a decision takes effect
-UNSTAKE_COOLDOWN     = 7 * 86400     # same window as governance
-                                       # gives time to catch misbehavior (slashing)
-LISTING_REWARD       = 1000 * SAT_PER_BIO   # sats -- paid once per confirmed exchange/DEX
+GOVERNANCE_THRESHOLD = 0.70
+GOVERNANCE_MIN_VOTES = 21
+GOVERNANCE_TIMELOCK  = 7 * 86400
+UNSTAKE_COOLDOWN     = 7 * 86400
+LISTING_REWARD       = 1000 * SAT_PER_BIO
 
-# developer grants pool -- the 509,000 BIO genesis remainder
 DEVELOPER_GRANTS_POOL_SIZE = 509_000 * SAT_PER_BIO
-DEVELOPER_GRANT_MAX        = 5_000 * SAT_PER_BIO    # ceiling per single
-# grant -- same "voted amount clamped to a ceiling" pattern as
+DEVELOPER_GRANT_MAX        = 5_000 * SAT_PER_BIO
 
-# server_rewards -- split OUT of developer_grants, not a new
-SERVER_REWARDS_POOL_SIZE  = 254_500 * SAT_PER_BIO   # exactly half of 509,000
-DEVELOPER_GRANTS_POOL_SIZE_V41 = 509_000 * SAT_PER_BIO - SERVER_REWARDS_POOL_SIZE  # the other half, post-split
-SERVER_REWARD_MAX = 2_000 * SAT_PER_BIO   # ceiling per single reward -- same
-# "voted amount clamped to a ceiling" pattern as developer_grant/
+SERVER_REWARDS_POOL_SIZE  = 254_500 * SAT_PER_BIO
+DEVELOPER_GRANTS_POOL_SIZE_V41 = 509_000 * SAT_PER_BIO - SERVER_REWARDS_POOL_SIZE
+SERVER_REWARD_MAX = 2_000 * SAT_PER_BIO
 
-# ── HTLC atomic swaps  ─────────────────────────────
-SWAP_MIN_LOCK        = 1 * SAT_PER_BIO   # dust floor for locks (sats)
-SWAP_LOCK_TIMEOUT_MIN = 3600             # 1 hour  (seconds, chain-time)
-SWAP_LOCK_TIMEOUT_MAX = 7 * 86400        # 7 days
-SWAP_OFFER_TTL_MIN    = 3600             # 1 hour
-SWAP_OFFER_TTL_MAX    = 30 * 86400       # 30 days
-SWAP_MAX_ACTIVE_LOCKS = 10               # per sender -- griefing cap
+SWAP_MIN_LOCK        = 1 * SAT_PER_BIO
+SWAP_LOCK_TIMEOUT_MIN = 3600
+SWAP_LOCK_TIMEOUT_MAX = 7 * 86400
+SWAP_OFFER_TTL_MIN    = 3600
+SWAP_OFFER_TTL_MAX    = 30 * 86400
+SWAP_MAX_ACTIVE_LOCKS = 10
 SWAP_ASSET_MAX_LEN    = 32
 
-# ── State checkpoints  ─────────────────────────────
-STATE_SNAPSHOT_EVERY  = 5000   # blocks between full state snapshots (governable)
-STATE_SNAPSHOT_KEEP   = 3      # how many recent snapshots to retain on disk (governable)
+STATE_SNAPSHOT_EVERY  = 5000
+STATE_SNAPSHOT_KEEP   = 3
 SNAPSHOT_DIR          = "snapshots"
-                                       # listing, drawn from its own protected pool
-CHECKPOINT_EVERY     = 1000          # checkpoint every 1000 blocks
+CHECKPOINT_EVERY     = 1000
 assert STATE_SNAPSHOT_EVERY % CHECKPOINT_EVERY == 0, (
     "STATE_SNAPSHOT_EVERY must be a multiple of CHECKPOINT_EVERY -- "
     "otherwise a state snapshot could fire on a height where no "
     "lightweight checkpoint row exists yet to attach its hash to.")
-RATE_LIMIT_PER_MIN   = 60            # max 60 transactions per minute per address
-RATE_LIMIT_WINDOW    = 60            # window in seconds
-MEMPOOL_MAX          = 1000          # hard cap on queued impulses -- without
-                                       # this, a flood of validly-signed
-PAYLOAD_MAX_CHARS    = 4096          # hard cap on the free-form payload field
-                                       # (PROPOSAL/VOTE JSON). Everything else
 
-# PEER-TO-PEER -- other independent servers, not wallets
+WAL_CHECKPOINT_EVERY = 5000
+RATE_LIMIT_PER_MIN   = 60
+RATE_LIMIT_WINDOW    = 60
+MEMPOOL_MAX          = 1000
+PAYLOAD_MAX_CHARS    = 4096
+
 DEFAULT_BOOTSTRAP_PEERS = [
     "https://biochainnetwork.com/api",
     "https://node2.biochainnetwork.com/api",
 ]
 _ENV_PEERS = os.environ.get("BIOCHAIN_PEER_URLS", "").strip()
-# SELF_URL first -- needed below to keep a node from listing itself.
 SELF_URL = os.environ.get("BIOCHAIN_SELF_URL", "").strip().rstrip("/")
 if _ENV_PEERS.lower() in ("none", "standalone", "off"):
-    PEER_URLS = []          # explicit isolation (dev / tests)
+    PEER_URLS = []
 elif _ENV_PEERS:
     PEER_URLS = [u.strip().rstrip("/") for u in _ENV_PEERS.split(",") if u.strip()]
 else:
-    PEER_URLS = list(DEFAULT_BOOTSTRAP_PEERS)   # public distribution default
-# A seed node's own URL is naturally IN the seed list -- filter it out
+    PEER_URLS = list(DEFAULT_BOOTSTRAP_PEERS)
 if SELF_URL:
     PEER_URLS = [u for u in PEER_URLS if u != SELF_URL]
 PEER_SYNC_INTERVAL_SECONDS = 15
 PEER_REQUEST_TIMEOUT_SECONDS = 5
 
-# cryptographic self-recognition, layered ON TOP OF the SELF_URL
 INSTANCE_ID = secrets.token_hex(16)
 
-# PARAMETERS GOVERNABLE BY VOTE
 GOVERNABLE_PARAMS = {
     "emerge_threshold":    {"min": 3,        "max": 1000,        "cast": int},
     "burn_rate":           {"min": 0.00001,  "max": 0.01,        "cast": float},
@@ -170,13 +153,11 @@ GOVERNABLE_PARAMS = {
     "tier_validator_min":  {"min": 1.0,      "max": 10_000_000.0,"cast": float},
     "tier_senior_min":     {"min": 1.0,      "max": 10_000_000.0,"cast": float},
     "tier_anchor_min":     {"min": 1.0,      "max": 10_000_000.0,"cast": float},
-    # The floor here is 21, matching GOVERNANCE_MIN_VOTES' own starting
     "governance_min_votes":{"min": 21,       "max": 10_000,      "cast": int},
-    # Not lowered proactively -- the ecosystem pool is currently healthy.
     "longevity_monthly_reward": {"min": 0.1, "max": 21.0,        "cast": float},
-    # floor is 1 day -- governance may never disable Sybil-resistance entirely
     "min_emergence_span_seconds": {"min": 86400, "max": 90 * 86400, "cast": int},
-    "fee_burn_percent": {"min": 0, "max": 50, "cast": int},   # starts at 0
+    "fee_burn_percent": {"min": 0, "max": 50, "cast": int},
+    "transfer_fee_flat": {"min": 0.0, "max": 1.0, "cast": float},
 }
 
 def _current_param_value(key: str):
@@ -184,6 +165,7 @@ def _current_param_value(key: str):
     return {
         "emerge_threshold":   EMERGE_THRESHOLD,
         "burn_rate":          Emission.BURN_RATE,
+        "transfer_fee_flat":  sat_to_bio(Emission.TRANSFER_FEE_BASE),
         "theta_s":            net.THETA_S,
         "theta_w":            net.THETA_W,
         "theta_i":            net.THETA_I,
@@ -202,18 +184,16 @@ def apply_governance_param(key: str, raw_value: str, proposal_id: int = 0):
     """Applies an approved parameter to the live network."""
     global EMERGE_THRESHOLD, REBIRTH_THRESHOLD, RATE_LIMIT_PER_MIN, CHECKPOINT_EVERY, GOVERNANCE_MIN_VOTES, LONGEVITY_MONTHLY_REWARD, MIN_EMERGENCE_SPAN_SECONDS
 
-    # SLASH -- special case. This is a one-time ACTION, not a persistent
     if key == "slash":
         try:
             data   = json.loads(raw_value)
             target = data["address"]
-            amount = bio_to_sat(data["amount"])   # voted in BIO, applied in sats
+            amount = bio_to_sat(data["amount"])
             reason = data.get("reason", "")
         except Exception as e:
             return False, f"invalid slash format -- needs JSON {{address,amount,reason}}: {e}"
         return _apply_slash(target, amount, reason)
 
-    # LISTING_REWARD -- same pattern as SLASH: a one-time action voted on
     if key == "listing_reward":
         try:
             data   = json.loads(raw_value)
@@ -222,9 +202,9 @@ def apply_governance_param(key: str, raw_value: str, proposal_id: int = 0):
             pair_identifier = data.get("pair_identifier", "")
             amount_bio      = data.get("amount", None)
             if amount_bio is None:
-                amount_sat = LISTING_REWARD          # backward-compatible default
+                amount_sat = LISTING_REWARD
             else:
-                amount_sat = bio_to_sat(amount_bio)  # voted in BIO, applied in sats
+                amount_sat = bio_to_sat(amount_bio)
                 if amount_sat < 1 * SAT_PER_BIO or amount_sat > LISTING_REWARD:
                     return False, (f"listing_reward amount out of range: {amount_bio} BIO "
                                    f"(allowed 1 .. {sat_to_bio(LISTING_REWARD):.0f} BIO)")
@@ -232,7 +212,6 @@ def apply_governance_param(key: str, raw_value: str, proposal_id: int = 0):
             return False, f"invalid listing_reward format -- needs JSON {{address,exchange_name,pair_identifier,amount?}}: {e}"
         return _apply_listing_reward(target, exchange_name, pair_identifier, proposal_id, amount_sat)
 
-    # DEVELOPER_GRANT -- same pattern as listing_reward. Funds real-world
     if key == "developer_grant":
         try:
             data   = json.loads(raw_value)
@@ -251,7 +230,6 @@ def apply_governance_param(key: str, raw_value: str, proposal_id: int = 0):
             return False, f"invalid developer_grant format -- needs JSON {{address,project_name,project_description,amount?}}: {e}"
         return _apply_developer_grant(target, project_name, project_description, proposal_id, amount_sat)
 
-    # SERVER_REWARD -- same pattern as developer_grant, replacing
     if key == "server_reward":
         try:
             data   = json.loads(raw_value)
@@ -281,12 +259,12 @@ def apply_governance_param(key: str, raw_value: str, proposal_id: int = 0):
 
     if key == "emerge_threshold":
         EMERGE_THRESHOLD  = int(value)
-        REBIRTH_THRESHOLD = EMERGE_THRESHOLD   # keep in sync -- otherwise REBIRTH
-                                                 # would stay frozen at the old value
+        REBIRTH_THRESHOLD = EMERGE_THRESHOLD
     elif key == "burn_rate":
-        # Governance input stays in the familiar fractional form
         Emission.BURN_RATE_PPM = int(round(value * 1_000_000))
         Emission.BURN_RATE     = Emission.BURN_RATE_PPM / 1_000_000
+    elif key == "transfer_fee_flat":
+        Emission.TRANSFER_FEE_BASE = int(round(value * SAT_PER_BIO))
     elif key == "theta_s":
         net.THETA_S = value
     elif key == "theta_w":
@@ -300,9 +278,9 @@ def apply_governance_param(key: str, raw_value: str, proposal_id: int = 0):
     elif key == "min_emergence_span_seconds":
         MIN_EMERGENCE_SPAN_SECONDS = int(value)
     elif key == "fee_burn_percent":
-        Emission.FEE_BURN_PERCENT = int(value)   # class attribute, read directly by burn()
+        Emission.FEE_BURN_PERCENT = int(value)
     elif key == "tier_validator_min":
-        STAKE_TIERS["VALIDATOR"]["min_bio"] = bio_to_sat(value)         # voted in BIO, stored in sats
+        STAKE_TIERS["VALIDATOR"]["min_bio"] = bio_to_sat(value)
     elif key == "tier_senior_min":
         STAKE_TIERS["SENIOR_VALIDATOR"]["min_bio"] = bio_to_sat(value)
     elif key == "tier_anchor_min":
@@ -314,27 +292,24 @@ def apply_governance_param(key: str, raw_value: str, proposal_id: int = 0):
     else:
         return False, "not implemented"
 
-    db.set_param_override(key, value)   # survives a server restart
+    db.set_param_override(key, value)
     return True, f"{key} = {value}"
 
-# NODE ROLES
 ROLES = ["VALIDATOR", "KEEPER", "ROUTER"]
 
 ROLE_BONUS = {
-    # Energy bonus per impulse, by role
-    "VALIDATOR": {"energy": 1.0, "reputation": 0.02},  # reputation grows faster
-    "KEEPER":    {"energy": 2.0, "reputation": 0.01},  # holds energy better
-    "ROUTER":    {"energy": 0.5, "reputation": 0.01},  # relays impulses faster
+    "VALIDATOR": {"energy": 1.0, "reputation": 0.02},
+    "KEEPER":    {"energy": 2.0, "reputation": 0.01},
+    "ROUTER":    {"energy": 0.5, "reputation": 0.01},
 }
 
-INHERITANCE_GOOD = 0.5   # 50% of reputation passed to successor
-INHERITANCE_BAD  = 0.3   # 30% of accumulated risk passed on
+INHERITANCE_GOOD = 0.5
+INHERITANCE_BAD  = 0.3
 
-# RATE LIMITER
 class RateLimiter:
     """Spam protection -- at most RATE_LIMIT_PER_MIN transactions per minute from a single address."""
     def __init__(self):
-        self._counts = {}   # address → [timestamp, ...]
+        self._counts = {}
         self._lock   = threading.Lock()
 
     def check(self, address: str) -> bool:
@@ -343,7 +318,6 @@ class RateLimiter:
         with self._lock:
             if address not in self._counts:
                 self._counts[address] = []
-            # Drop old entries outside the window
             self._counts[address] = [
                 t for t in self._counts[address]
                 if now - t < RATE_LIMIT_WINDOW
@@ -355,16 +329,8 @@ class RateLimiter:
 
 rate_limiter = RateLimiter()
 
-# guards any operation that creates a new block
 _chain_lock = threading.RLock()
 
-# POST-QUANTUM CRYPTOGRAPHY
-# Primary backend: liboqs (C reference implementation behind the NIST
-# ML-DSA standardisation effort) via its official python bindings.
-# Automatic fallback: dilithium_py (pure python) with a loud startup
-# warning -- functionally identical, cross-verified signatures, but
-# roughly 267x slower at verification. There is no silent degradation
-# and no insecure fallback of any kind.
 _PQ_BACKEND = None
 
 try:
@@ -394,9 +360,6 @@ try:
             with _oqs.Signature(_LiboqsMLDSA44._ALG) as v:
                 return v.verify(bytes(message), bytes(signature), bytes(pk))
 
-    # prove the backend actually works before trusting it with funds:
-    # a full keygen/sign/verify round-trip plus a tamper rejection,
-    # executed once at startup -- if any of this fails, fall back.
     _pk_t, _sk_t = _LiboqsMLDSA44.keygen()
     _sig_t = _LiboqsMLDSA44.sign(_sk_t, b"backend-selftest")
     if not _LiboqsMLDSA44.verify(_pk_t, b"backend-selftest", _sig_t):
@@ -439,7 +402,6 @@ class PQCrypto:
 
     def verify(self, pk, message: str, signature: str, scheme_id: str = "MLDSA44") -> bool:
         if scheme_id != "MLDSA44":
-            # No other scheme is registered yet -- this branch exists so
             print(f"[PQ] verify error: unknown scheme_id '{scheme_id}'")
             return False
         try:
@@ -451,16 +413,13 @@ class PQCrypto:
     def address(self, pk, scheme_id: str = "MLDSA44") -> str:
         raw = pk if isinstance(pk, bytes) else str(pk).encode()
         if scheme_id == "MLDSA44":
-            # EXACTLY the original formula -- every address created
             return "BIO1" + hashlib.sha3_256(raw).hexdigest()[:16].upper()
-        # Any future scheme folds its own id into the hash, so it can
         tagged = scheme_id.encode() + raw
         return "BIO1" + hashlib.sha3_256(tagged).hexdigest()[:16].upper()
 
 pq = PQCrypto()
 
-# REQUEST SIGNING -- proves the caller actually owns the address
-REQUEST_FRESHNESS_SECONDS = 120   # signed requests are valid for this long
+REQUEST_FRESHNESS_SECONDS = 120
 
 def verify_signed_request(address: str, pubkey_hex: str, signature_hex: str,
                            message: str, timestamp: float):
@@ -482,9 +441,7 @@ def verify_signed_request(address: str, pubkey_hex: str, signature_hex: str,
 
     return True, ""
 
-# APPLICATION
 app = FastAPI(title="BioChain AAECN")
-#  CORS hardening: origins now come from BIOCHAIN_CORS_ORIGINS
 _cors_env = os.environ.get("BIOCHAIN_CORS_ORIGINS", "").strip()
 _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()] or ["*"]
 if _cors_origins == ["*"]:
@@ -500,7 +457,6 @@ app.add_middleware(
 )
 ws_clients = set()
 
-# DATABASE
 DB_PATH = "biochain.db"
 
 class Database:
@@ -508,11 +464,10 @@ class Database:
         self.path = path
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")   # better concurrency under load
-        self.conn.execute("PRAGMA synchronous=NORMAL") # good durability/speed tradeoff
-        self.lock = threading.RLock()   # reentrant -- transaction() can be
-                                          # entered again from nested methods
-        self._in_txn = False            # True while a transaction() block is running
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.lock = threading.RLock()
+        self._in_txn = False
         self._init()
 
     def _init(self):
@@ -547,7 +502,8 @@ class Database:
                     last_monthly_payout REAL DEFAULT 0,
                     tx_count_at_death INTEGER DEFAULT 0,
                     inherited_rep    REAL DEFAULT 0,
-                    inherited_risk   REAL DEFAULT 0
+                    inherited_risk   REAL DEFAULT 0,
+                    state_block      INTEGER DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS blocks (
@@ -752,41 +708,37 @@ class Database:
             """)
             self._commit()
 
-            # imp_nonce column for blocks created before this column
             try:
                 self.conn.execute(
                     "ALTER TABLE blocks ADD COLUMN imp_nonce INTEGER DEFAULT 0"
                 )
                 self._commit()
             except Exception:
-                pass  # column already exists
+                pass
 
-            # pool_wallet_registration for economy rows created
             try:
                 self.conn.execute(
                     "ALTER TABLE economy ADD COLUMN pool_wallet_registration INTEGER DEFAULT 0"
                 )
                 self._commit()
             except Exception:
-                pass  # column already exists
+                pass
 
-            # total_destroyed for economy rows created before
             try:
                 self.conn.execute(
                     "ALTER TABLE economy ADD COLUMN total_destroyed INTEGER DEFAULT 0"
                 )
                 self._commit()
             except Exception:
-                pass  # column already exists
+                pass
 
-            # pool_developer_grants for economy rows created
             try:
                 self.conn.execute(
                     "ALTER TABLE economy ADD COLUMN pool_developer_grants INTEGER DEFAULT 0"
                 )
                 self._commit()
             except Exception:
-                pass  # column already exists
+                pass
 
             try:
                 self.conn.execute(
@@ -794,9 +746,8 @@ class Database:
                 )
                 self._commit()
             except Exception:
-                pass  # column already exists
+                pass
 
-            # /server_rewards_paid is a table that may not
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS server_rewards_paid (
                     url          TEXT PRIMARY KEY,
@@ -807,23 +758,29 @@ class Database:
             """)
             self._commit()
 
-            # migrate rows created before this column existed
             try:
                 self.conn.execute(
                     "ALTER TABLE wallets ADD COLUMN registration_got INTEGER DEFAULT 0"
                 )
                 self._commit()
             except Exception:
-                pass  # column already exists
+                pass
 
-            # migrate rows created before this column existed
             try:
                 self.conn.execute(
                     "ALTER TABLE wallets ADD COLUMN sig_scheme TEXT DEFAULT 'MLDSA44'"
                 )
                 self._commit()
             except Exception:
-                pass  # column already exists
+                pass
+
+            try:
+                self.conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN state_block INTEGER DEFAULT 0"
+                )
+                self._commit()
+            except Exception:
+                pass
 
     def _commit(self):
         """Commits right away, or defers if inside a transaction() block."""
@@ -834,22 +791,20 @@ class Database:
     def transaction(self):
         """Groups writes into one all-or-nothing unit."""
         with self.lock:
-            if self._in_txn:          # already inside an outer transaction -- just join it
+            if self._in_txn:
                 yield
                 return
             self._in_txn = True
             try:
                 yield
-                self.conn.commit()    # success: everything lands together
+                self.conn.commit()
             except Exception:
-                self.conn.rollback()  # any failure -- nonce, signature, debit -- all undone
+                self.conn.rollback()
                 raise
             finally:
                 self._in_txn = False
 
-    # ── Wallets ──────────────────────────────
     def ensure_wallet(self, address: str):
-        # explicit column list, not positional VALUES -- the table
         with self.lock:
             self.conn.execute(
                 "INSERT OR IGNORE INTO wallets (address, balance, first_seen, tx_count, genesis_got, registration_got) "
@@ -884,13 +839,12 @@ class Database:
             row = self.conn.execute("SELECT COUNT(*) as c FROM wallets").fetchone()
             return int(row["c"]) if row else 0
 
-        # Atomic debit -- FIX 1
 
     def debit(self, address: str, amount: int) -> bool:
         """amount is in SATS (int)."""
         amount = int(amount)
         if amount < 0:
-            return False   # a negative debit would be a hidden credit
+            return False
         with self.lock:
             row = self.conn.execute(
                 "SELECT balance FROM wallets WHERE address=?", (address,)
@@ -926,9 +880,7 @@ class Database:
             )
             self._commit()
 
-    # Atomic genesis grant -- FIX 2
     def try_give_genesis(self, address: str, amount: int) -> int:
-        # amount in SATS (int)
         with self.lock:
             cur = self.conn.execute(
                 "UPDATE wallets SET balance=balance+?, genesis_got=1 "
@@ -952,7 +904,6 @@ class Database:
 
     def try_give_registration(self, address: str, amount: int) -> int:
         """first-100 wallet-registration grant."""
-        # amount in SATS (int)
         with self.lock:
             cur = self.conn.execute(
                 "UPDATE wallets SET balance=balance+?, registration_got=1 "
@@ -968,12 +919,11 @@ class Database:
             self._commit()
         return amount
 
-    # ── Nodes ─────────────────────────────────
     def save_node(self, node):
         with self.lock:
             self.conn.execute("""
                 INSERT OR REPLACE INTO nodes
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 node.address, node.balance, node.energy,
                 node.activity, node.recent_activity, node.reputation, node.age,
@@ -986,6 +936,7 @@ class Database:
                 getattr(node, "tx_count_at_death", 0) or 0,
                 getattr(node, "inherited_rep", 0.0) or 0.0,
                 getattr(node, "inherited_risk", 0.0) or 0.0,
+                getattr(node, "state_block", 0) or 0,
             ))
             self._commit()
 
@@ -1000,7 +951,6 @@ class Database:
             ).fetchone()
             return int(row["c"]) if row else 0
 
-        # ── Blocks ────────────────────────────────
 
     def save_block(self, block):
         with self.lock:
@@ -1024,9 +974,7 @@ class Database:
             ))
             self._commit()
 
-    # ── Economy ───────────────────────────────
     def save_economy(self, eco, em):
-        # explicit column list, not positional VALUES
         with self.lock:
             self.conn.execute("""
                 INSERT OR REPLACE INTO economy
@@ -1046,7 +994,6 @@ class Database:
                 em.pools.get("wallet_registration", 0),
                 em.total_destroyed,
                 em.pools.get("developer_grants", 0),
-                #  CRITICAL: without this line, INSERT OR REPLACE
                 em.pools.get("server_rewards", 0),
             ))
             self._commit()
@@ -1057,7 +1004,6 @@ class Database:
                 "SELECT * FROM economy WHERE id=1"
             ).fetchone()
 
-        # ── Events ────────────────────────────────
 
     def log(self, event_type: str, message: str):
         with self.lock:
@@ -1080,15 +1026,67 @@ class Database:
                 "SELECT * FROM blocks ORDER BY idx"
             ).fetchall()
 
+    def load_blocks_streaming(self):
+        """PERF FIX (v5.43): same query as load_blocks(), but yields rows
+        one at a time via the cursor instead of fetchall()'ing the whole
+        result set into memory up front. Used by restore() specifically
+        so that cold-block rows (outside the hot window) can be dropped
+        by Python's GC as soon as they're processed into a lightweight
+        _LazyBlock, rather than every row's raw pubkey/signature hex
+        strings staying resident for the whole restore just because
+        fetchall() grabbed them all at once."""
+        with self.lock:
+            cursor = self.conn.execute("SELECT * FROM blocks ORDER BY idx")
+            for row in cursor:
+                yield row
+
+    def count_blocks_table(self) -> int:
+        """Cheap COUNT(*) -- used by restore() to compute the hot-window
+        cutoff before streaming rows, without needing two full passes."""
+        with self.lock:
+            return self.conn.execute("SELECT COUNT(*) c FROM blocks").fetchone()["c"]
+
+    def load_block_by_index(self, index: int):
+        """Single-row lookup, used by _LazyBlock.impulse's first access --
+        the whole point of lazy loading is to never pay for this unless
+        someone actually needs a specific COLD block's full impulse
+        details (fork resolution touching old history, a manual /block
+        query -- not the hot per-transaction path)."""
+        with self.lock:
+            return self.conn.execute(
+                "SELECT * FROM blocks WHERE idx = ?", (index,)
+            ).fetchone()
+
+    def wal_checkpoint(self):
+        """Forces SQLite to flush its WAL file into the main DB file and
+        truncate it back down -- pure local disk housekeeping, not
+        consensus-relevant in any way. See WAL_CHECKPOINT_EVERY for the
+        naming-collision note and the real incident that motivated this.
+
+        Returns (busy, log_frames, checkpointed_frames) so the caller can
+        tell a full truncation from a partial one -- a partial checkpoint
+        does NOT raise an exception on its own (SQLite just returns
+        busy=1 silently), which is exactly how an earlier version of
+        this went unnoticed: it "succeeded" without actually truncating,
+        inside a single long-running process with many prior queries."""
+        with self.lock:
+            row = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            busy, log_frames, checkpointed = tuple(row)
+            if busy:
+                print(f"[WAL] checkpoint did NOT fully truncate -- busy={busy}, "
+                      f"{checkpointed}/{log_frames} frames checkpointed. Likely "
+                      f"cause: another open cursor/read transaction on this "
+                      f"connection. WAL will keep growing until a checkpoint "
+                      f"succeeds fully.")
+            return busy, log_frames, checkpointed
+
     def count_blocks(self) -> int:
         with self.lock:
             row = self.conn.execute("SELECT COUNT(*) as c FROM blocks").fetchone()
             return int(row["c"]) if row else 0
 
-        # ── Checkpoints ──────────────────────────
 
     def save_checkpoint(self, block_idx: int, block_hash: str, nodes_alive: int, state_hash: str = None):
-        # explicit column list, not positional VALUES
         with self.lock:
             self.conn.execute(
                 "INSERT OR REPLACE INTO checkpoints (block_idx, block_hash, created_at, nodes_alive, state_hash) VALUES (?,?,?,?,?)",
@@ -1125,7 +1123,6 @@ class Database:
                 "SELECT * FROM checkpoints ORDER BY block_idx DESC"
             ).fetchall()
 
-        # governance overrides -- applied parameters survive restarts
 
     def get_param_overrides(self):
         with self.lock:
@@ -1139,7 +1136,6 @@ class Database:
             )
             self._commit()
 
-    # -- Signature replay protection -----------
     def use_signature_once(self, signature: str, address: str, used_at: float) -> bool:
         """Atomically records a signature as spent."""
         try:
@@ -1221,7 +1217,6 @@ class Database:
             )
             self._commit()
 
-    # ── Stakes ───────────────────────────────
     def get_stake(self, address: str):
         with self.lock:
             return self.conn.execute(
@@ -1258,7 +1253,6 @@ class Database:
             )
             self._commit()
 
-    # ── HTLC swap storage  ────────────────────────────────────
     def create_swap_lock(self, lock_id, sender, receiver, amount, hash_lock, created_t, timeout):
         with self.lock:
             self.conn.execute(
@@ -1304,7 +1298,6 @@ class Database:
                 "SELECT COALESCE(SUM(bio_amount),0) s FROM pending_unstakes WHERE claimed=0"
             ).fetchone()["s"])
 
-    # ── Node discovery candidates  ──────────────────
 
     def note_node_candidate(self, url: str, reporter_url: str, now: float = None):
         """Record that reporter_url (a peer we already trust enough to have gossiped with) told us about this candidate url."""
@@ -1319,7 +1312,6 @@ class Database:
                 self.conn.execute(
                     "INSERT INTO node_candidates (url, first_seen_at, last_confirmed_at) VALUES (?,?,?)",
                     (url, now, now))
-            # a duplicate report from the same reporter is ignored
             self.conn.execute(
                 "INSERT OR IGNORE INTO candidate_reports (url, reporter_url, reported_at) VALUES (?,?,?)",
                 (url, reporter_url, now))
@@ -1377,7 +1369,6 @@ class Database:
                 (url, now, confirmations))
             promoted = cur.rowcount > 0
             if promoted:
-                # once promoted, drop this URL from the candidate tables
                 self.conn.execute("DELETE FROM candidate_reports WHERE url=?", (url,))
                 self.conn.execute("DELETE FROM node_candidates WHERE url=?", (url,))
             self._commit()
@@ -1468,13 +1459,12 @@ class Database:
                 "SELECT * FROM stakes ORDER BY bio_amount DESC"
             ).fetchall()
 
-        # ── Proposals ─────────────────────────────
 
     def create_proposal(self, title: str, description: str,
                         proposer: str, now: float, duration_days: int = 7,
                         param_key: str = "", param_value: str = ""):
         ends_at = now + duration_days * 86400
-        apply_at = ends_at + GOVERNANCE_TIMELOCK  # +7 day timelock
+        apply_at = ends_at + GOVERNANCE_TIMELOCK
         with self.lock:
             self.conn.execute("""
                 INSERT INTO proposals
@@ -1482,7 +1472,6 @@ class Database:
                 VALUES (?,?,?,?,?,?,?,?)
             """, (title, description, proposer, now, ends_at, apply_at,
                   param_key, param_value))
-            # Read last_insert_rowid() while STILL holding the lock and on
             new_id = self.conn.execute(
                 "SELECT last_insert_rowid() as id"
             ).fetchone()["id"]
@@ -1545,62 +1534,52 @@ class Database:
                 self._commit()
             return True
         except Exception:
-            return False  # already voted
+            return False
 
     def size_kb(self) -> float:
         return round(os.path.getsize(self.path) / 1024, 1) if os.path.exists(self.path) else 0.0
 
 db = Database()
 
-# EMISSION
 class Emission:
     MAX_SUPPLY        = 21_000_000
-    # Genesis grant tiers -- the first N addresses to emerge as nodes get
     GENESIS_TIERS = [
-        {"count": 1_000,  "amount": 100 * SAT_PER_BIO},   # sats
+        {"count": 1_000,  "amount": 100 * SAT_PER_BIO},
         {"count": 5_000,  "amount": 20  * SAT_PER_BIO},
         {"count": 10_000, "amount": 10  * SAT_PER_BIO},
     ]
-    GENESIS_MAX_COUNT = sum(t["count"] for t in GENESIS_TIERS)   # 16,000
-    HALVING_EVERY     = 365 * 24 * 3600   # one year in seconds
-    INITIAL_REWARD    = 10 * SAT_PER_BIO          # sats
-    MIN_REWARD        = SAT_PER_BIO // 1000       # 0.001 BIO floor, in sats
-    # flat base plus a thin percentage on top
-    TRANSFER_FEE_BASE = SAT_PER_BIO // 100   # 0.01 BIO flat, in sats
+    GENESIS_MAX_COUNT = sum(t["count"] for t in GENESIS_TIERS)
+    HALVING_EVERY     = 365 * 24 * 3600
+    INITIAL_REWARD    = 10 * SAT_PER_BIO
+    MIN_REWARD        = SAT_PER_BIO // 1000
+    TRANSFER_FEE_BASE = SAT_PER_BIO // 100
     BURN_RATE_PPM     = 500
-    BURN_RATE         = BURN_RATE_PPM / 1_000_000   # display/govern input only
-    # Staking pays a small flat fee, charged ON TOP of the staked amount
-    STAKE_FEE         = 1 * SAT_PER_BIO       # 1 BIO flat, in sats
+    BURN_RATE         = BURN_RATE_PPM / 1_000_000
+    STAKE_FEE         = 1 * SAT_PER_BIO
 
     def __init__(self):
         self.pools = {
-            "validators":      8_400_000 * SAT_PER_BIO,   # all pools in sats
+            "validators":      8_400_000 * SAT_PER_BIO,
             "ecosystem":       6_300_000 * SAT_PER_BIO,
             "reserve":         4_200_000 * SAT_PER_BIO,
             "team":            1_050_000 * SAT_PER_BIO,
-            "genesis":           820_000 * SAT_PER_BIO,  # covers genesis tiers (300k max)
-                                               # + founder grant (10k, already spent)
-            "listing_reserve":  230_000 * SAT_PER_BIO,  # reserved for confirmed exchange/DEX
-                                               # listings -- see listing_reward below
-            "wallet_registration": 0,   # filled at chain start by carving
-                                               # 1,000 BIO out of the founder's own
-            "developer_grants": 0,      # filled at chain start by
-                                               # moving DEVELOPER_GRANTS_POOL_SIZE
+            "genesis":           820_000 * SAT_PER_BIO,
+            "listing_reserve":  230_000 * SAT_PER_BIO,
+            "wallet_registration": 0,
+            "developer_grants": 0,
         }
-        self.minted          = 0    # sats
-        self.burned          = 0    # sats (= total fees collected, see burn())
-        self.total_destroyed = 0    # sats PERMANENTLY removed from
-        # sats permanently removed from supply -- distinct from self.burned
+        self.minted          = 0
+        self.burned          = 0
+        self.total_destroyed = 0
         self.halvings        = 0
         self.genesis_granted = 0
-        self.start_time      = time.time()   # moment emission started
+        self.start_time      = time.time()
         self._lock           = threading.Lock()
 
     def block_reward(self, now: float) -> float:
         """Year 1: 10 BIO Year 2: 5 BIO Year 3: 2.5 BIO ...minimum 0.001 BIO `now` is the chain's own time (see Network.chain_time), not this server's wall clock -- so."""
         elapsed  = now - self.start_time
         halvings = int(elapsed // self.HALVING_EVERY)
-        # Integer halving: exact division for the first 9 halvings
         return max(self.INITIAL_REWARD // (2 ** halvings), self.MIN_REWARD)
 
     def check_halving(self, chain_len: int, now: float):
@@ -1613,7 +1592,6 @@ class Emission:
             print(f"[HALVING] Year {self.halvings+1} -- reward {sat_to_bio(self.block_reward(now)):.4f} BIO")
 
     def _genesis_amount_for_index(self, index: int) -> int:
-        # returns SATS
         """Returns the grant amount for the (0-based) Nth genesis grant ever issued"""
         cumulative = 0
         for tier in self.GENESIS_TIERS:
@@ -1622,9 +1600,7 @@ class Emission:
                 return tier["amount"]
         return 0
 
-    # Atomic genesis grant -- FIX 2
     def try_genesis_grant(self, address: str) -> int:
-        # returns SATS granted (0 if none)
         if self.genesis_granted >= self.GENESIS_MAX_COUNT:
             return 0
         if self.pools["genesis"] <= 0:
@@ -1641,13 +1617,11 @@ class Emission:
         return given
 
     def mint_reward(self, node, chain_len: int, now: float) -> int:
-        # returns SATS
         """Validator reward -- now actually applies the tier multiplier, not just displays it in the API."""
         self.check_halving(chain_len, now)
         if self.pools["validators"] <= 0:
             return 0
-        # smooth taper instead of a hard cutoff
-        base_full  = self.block_reward(now)          # sats (int)
+        base_full  = self.block_reward(now)
         if self.pools["validators"] < VALIDATORS_TAPER_FLOOR:
             base = base_full * self.pools["validators"] // VALIDATORS_TAPER_FLOOR
         else:
@@ -1655,7 +1629,6 @@ class Emission:
         stake_row  = db.get_stake(node.address)
         tier       = stake_row["tier"] if stake_row else "NONE"
         mult       = STAKE_TIERS.get(tier, STAKE_TIERS["NONE"])["reward_mult"]
-        # reward_mult values are 1.0 / 1.5 / 2.0 -- multiply in int as
         desired    = (base * int(mult * 10)) // 10
         actual     = min(desired, self.pools["validators"])
         node.balance              += actual
@@ -1663,7 +1636,7 @@ class Emission:
         self.minted               += actual
         return actual
 
-    FEE_BURN_PERCENT = 0   # % of every fee permanently destroyed
+    FEE_BURN_PERCENT = 0
 
     def burn(self, amount: float):
         """fees now split two ways."""
@@ -1704,7 +1677,6 @@ class Emission:
             "pools":             {k: round(sat_to_bio(v), 2) for k, v in self.pools.items()},
         }
 
-# TEAM VESTING
 class Vesting:
     """5% of emission -- to the developer."""
     def __init__(self):
@@ -1712,20 +1684,17 @@ class Vesting:
         row = db.get_vesting()
         self.start_time     = row["start_time"] if row else time.time()
         self.claimed_months = row["claimed_months"] if row else 0
-        self.total_claimed  = int(row["total_claimed"]) if row else 0   # sats
+        self.total_claimed  = int(row["total_claimed"]) if row else 0
 
     def check_and_pay(self, emission, stability: float, now: float) -> int:
-        # returns SATS paid
         """Called after each block, using the chain's own time (not this server's wall clock -- see Network.chain_time)."""
         elapsed = now - self.start_time
 
-        # Cliff has not passed yet
         if elapsed < CLIFF_SECONDS:
             remaining = CLIFF_SECONDS - elapsed
             days = int(remaining / 86400)
             return 0
 
-        # How many months have passed since the cliff
         months_after_cliff = int((elapsed - CLIFF_SECONDS) / MONTH_SECONDS)
         payable_months     = min(months_after_cliff, VESTING_MONTHS)
         unpaid_months      = payable_months - self.claimed_months
@@ -1733,17 +1702,14 @@ class Vesting:
         if unpaid_months <= 0:
             return 0
 
-        # Crisis -- pause (the network's bad inheritance)
         if stability < 0.15:
             db.log("VESTING_PAUSED",
                    f"Crisis S={stability:.3f} -- payout deferred")
             return 0
 
-        # Paying out
         if emission.pools["team"] <= 0:
             return 0
 
-        # integer payout, summed month by month
         amount = 0
         for m in range(self.claimed_months + 1, self.claimed_months + unpaid_months + 1):
             amount += FINAL_MONTH_PAYOUT if m == VESTING_MONTHS else MONTHLY_PAYOUT
@@ -1761,7 +1727,6 @@ class Vesting:
         return amount
 
     def state(self, now: float = None) -> dict:
-        # display now follows CHAIN time when the caller provides it
         now = now if now is not None else time.time()
         elapsed       = now - self.start_time
         cliff_passed  = elapsed >= CLIFF_SECONDS
@@ -1778,7 +1743,6 @@ class Vesting:
             "next_payout":    f"month {self.claimed_months + 1}" if cliff_passed and self.claimed_months < VESTING_MONTHS else "waiting for cliff",
         }
 
-# ECONOMY
 class Economy:
     ALPHA = 0.1; BETA = 2.0; GAMMA = 0.90; DELTA = 0.01
     CRISIS_THRESHOLD = 0.15
@@ -1805,12 +1769,14 @@ class Economy:
             "stability":  round(self.stability(), 6),
         }
 
-# NODE (born from activity)
+_balance_rollback_record = None
+_balance_rollback_seen   = None
+
 class Node:
     """A node is not registered manually."""
     def __init__(self, address: str, births: int = 1, now: float = None):
         self.address    = address
-        self.balance         = db.get_balance(address)
+        self._balance         = db.get_balance(address)
         self.energy          = 10.0
         self.activity        = 0
         self.recent_activity = 0.0
@@ -1820,23 +1786,46 @@ class Node:
         self.births          = births
         self.born_at         = now if now is not None else time.time()
         self.died_at         = 0.0
-        self.tx_count_at_death = 0   # impulses already recorded before death
-        # rebirth needs new impulses after this point
+        self.tx_count_at_death = 0
         self.role            = random.choice(ROLES)
-        self.risk            = 0.0    # accumulated personal risk
-        self.inherited_rep   = 0.0    # reputation from ancestor (the good)
-        self.inherited_risk  = 0.0    # risk from ancestor (the bad)
-        # Longevity -- rewards for a long active life (see longevity_loop)
+        self.risk            = 0.0
+        self.inherited_rep   = 0.0
+        self.inherited_risk  = 0.0
         self.longevity_6mo_paid  = False
         self.longevity_12mo_paid = False
         self.last_monthly_payout = 0.0
+        self.state_block = 0
+        self.scheduled_death_block = None
+
+    @property
+    def balance(self):
+        return self._balance
+
+    @balance.setter
+    def balance(self, value):
+        global _balance_rollback_record, _balance_rollback_seen
+        if _balance_rollback_record is not None and self.address not in _balance_rollback_seen:
+            _balance_rollback_record.append((self, self._balance))
+            _balance_rollback_seen.add(self.address)
+        self._balance = value
+
+    def materialize(self, now_block: int):
+        """Bring self.energy and self.recent_activity up to date as of
+        now_block -- EXACT, not approximate: constant per-block subtraction
+        and constant-ratio multiplicative decay both telescope exactly
+        across N blocks, whether applied N times in a row or once as a
+        single closed-form step."""
+        elapsed = now_block - self.state_block
+        if elapsed > 0:
+            self.energy = max(self.energy - ENERGY_DECAY_RATE * elapsed, 0.0)
+            self.recent_activity = round(self.recent_activity * (RECENT_ACTIVITY_DECAY ** elapsed), 4)
+            self.state_block = now_block
 
     def weight(self, liquidity: float, risk: float) -> float:
         """Weight is based on RECENT activity -- not accumulated."""
         if not self.alive:
             return 0.0
         base = self.recent_activity * 1.0 + self.reputation * 2.0 + self.energy * 3.0
-        # Tier multiplier
         stake_row   = db.get_stake(self.address)
         tier        = stake_row["tier"] if stake_row else "NONE"
         weight_mult = STAKE_TIERS.get(tier, STAKE_TIERS["NONE"])["weight_mult"]
@@ -1850,7 +1839,7 @@ class Node:
         self.activity        += 1
         self.recent_activity  = min(self.recent_activity + 1.0, 100.0)
         self.reputation       = min(self.reputation + bonus["reputation"], 10.0)
-        self.risk            += 0.01 * value_bio   # personal risk grows with volume
+        self.risk            += 0.01 * value_bio
         self.age             += 0.1
 
     def on_impulse_received(self, value: int):
@@ -1891,12 +1880,11 @@ class Node:
         """Applies inheritance from an ancestor upon rebirth"""
         self.inherited_rep  = good_rep
         self.inherited_risk = bad_risk
-        self.reputation     = 1.0 + good_rep    # the good -- starts higher
-        self.risk           = bad_risk           # the bad -- carries the ancestor's burden
+        self.reputation     = 1.0 + good_rep
+        self.risk           = bad_risk
         self.energy         = 10.0 + good_rep * 5
-        # Deterministic, not random.random() -- this runs inside
         seed = hashlib.sha256(f"{self.address}{self.births}".encode()).hexdigest()
-        if int(seed, 16) % 100 < 30:               # ~30% chance to inherit the role
+        if int(seed, 16) % 100 < 30:
             self.role = parent_role
         db.log("INHERITANCE_APPLIED",
                f"{self.address[:16]} inherited rep+{good_rep:.2f} risk+{bad_risk:.2f} role={self.role}")
@@ -1904,7 +1892,6 @@ class Node:
               f"rep={self.reputation:.2f} risk={self.risk:.2f} role={self.role}")
 
     def to_dict(self, liquidity: float, risk: float) -> dict:
-        # Fetch tier from the database
         stake_row  = db.get_stake(self.address)
         tier       = stake_row["tier"] if stake_row else "NONE"
         bio_staked = int(stake_row["bio_amount"]) if stake_row else 0
@@ -1935,7 +1922,6 @@ class Node:
             "longevity_12mo_paid": self.longevity_12mo_paid,
         }
 
-# IMPULSE AND BLOCK
 class Impulse:
     """Impulse energy = transaction value."""
     LAMBDA = 1.0
@@ -1943,45 +1929,38 @@ class Impulse:
     def __init__(self, sender, receiver, value, index, phi_bio_snap, pubkey_hex="", signature_hex="", signed_timestamp=0.0, kind="TRANSFER", payload="", nonce=0):
         self.sender   = sender
         self.receiver = receiver
-        self.value    = int(value)          # SATS 
+        self.value    = int(value)
         self.t        = time.time()
         self.phi_bio  = phi_bio_snap
-        # energy stays in the BIO scale, not sats
         self.energy   = self.LAMBDA * sat_to_bio(value)
-        self.kind     = kind   # "TRANSFER" | "STAKE" | "UNSTAKE" | "PROPOSAL" | "VOTE"
-        self.payload  = payload   # JSON string -- kind-specific extra data
-        # PROPOSAL/VOTE need more than sender/receiver/value can hold
+        self.kind     = kind
+        self.payload  = payload
         self.pubkey_hex       = pubkey_hex
         self.signature_hex    = signature_hex
         self.signed_timestamp = signed_timestamp
-        # the timestamp actually signed over, not self.t
-        self.nonce = int(nonce)   # the sender's own strictly-increasing
+        self.nonce = int(nonce)
         raw           = f"{kind}{sender}{receiver}{value}{self.t}{index}{payload}"
         self.id       = hashlib.sha256(raw.encode()).hexdigest()
 
 class Block:
     """A block's legitimacy rests on two independently verifiable things -- not a validator signature, which would add nothing real: the sender's own signature on the."""
     def __init__(self, index, prev_hash, impulse, validator, reward=0):
-        # reward in SATS (int)
         self.index     = index
         self.prev_hash = prev_hash
         self.impulse   = impulse
         self.validator = validator
         self.reward    = reward
-        self.t         = impulse.t   # the SAME moment as the impulse, not
-        # a separate time.time() call a few microseconds later -- otherwise
+        self.t         = impulse.t
         raw            = f"{index}{prev_hash}{impulse.id}{validator}{self.t}"
         self.hash      = hashlib.sha256(raw.encode()).hexdigest()
 
-# STUB CLASSES FOR RESTORING THE CHAIN FROM THE DATABASE
 class _ImpulseStub:
     """Lightweight stub for restoring an impulse from the database"""
     def __init__(self, sender, receiver, value, energy,
                  phi_bio, imp_id, t, pubkey_hex="", signature_hex="", signed_timestamp=0.0, kind="TRANSFER", payload="", nonce=0):
         self.sender   = sender
         self.receiver = receiver
-        self.value    = int(value)      # SATS -- coerced here so every
-                                          # restore/replay path gets int
+        self.value    = int(value)
         self.energy   = energy
         self.phi_bio  = phi_bio
         self.id       = imp_id
@@ -2001,16 +1980,61 @@ class _BlockStub:
         self.hash      = hash_
         self.prev_hash = prev_hash
         self.validator = validator
-        self.reward    = int(reward)    # SATS
+        self.reward    = int(reward)
         self.t         = t
         self.impulse   = impulse
 
-# NETWORK
+def _impulse_from_row(row) -> "_ImpulseStub":
+    """Shared row -> Impulse construction, used both when eagerly loading
+    a hot-window block (restore()) and when lazily loading a cold one
+    (_LazyBlock.impulse) -- one source of truth for the mapping."""
+    return _ImpulseStub(
+        row["imp_sender"],   row["imp_receiver"],
+        row["imp_value"],    row["imp_energy"],
+        row["imp_phi_bio"],  row["imp_id"],
+        row["timestamp"],
+        row["imp_pubkey"],   row["imp_signature"],
+        row["imp_signed_ts"], row["imp_kind"], row["imp_payload"],
+        row["imp_nonce"] or 0,
+    )
+
+class _LazyBlock:
+    """PERF FIX (v5.43): lightweight representation for the 'cold' part
+    of the chain -- everything outside the recent hot window (see
+    CHAIN_HOT_WINDOW). Holds only the cheap scalar fields every
+    consensus-relevant operation actually needs (hash, prev_hash, index,
+    validator, reward, t). The dominant memory cost per block is the
+    impulse's signature+pubkey hex strings (~7.5KB, measured directly
+    this session) -- .impulse is a lazy property that only pays for
+    those the first time something ACTUALLY needs this specific old
+    block's full impulse data (fork resolution touching deep history, a
+    manual /chain query), not on every restart or ever for blocks nobody
+    asks about again. Caches after first access, same object identity
+    guarantees as a normal attribute from then on."""
+    __slots__ = ("index", "hash", "prev_hash", "validator", "reward", "t", "_impulse_cache")
+
+    def __init__(self, index, hash_, prev_hash, validator, reward, t):
+        self.index     = index
+        self.hash      = hash_
+        self.prev_hash = prev_hash
+        self.validator = validator
+        self.reward    = int(reward)
+        self.t         = t
+        self._impulse_cache = None
+
+    @property
+    def impulse(self):
+        if self._impulse_cache is None:
+            row = db.load_block_by_index(self.index)
+            if row is None:
+                raise RuntimeError(f"cold block {self.index} missing from database -- data corruption")
+            self._impulse_cache = _impulse_from_row(row)
+        return self._impulse_cache
+
 
 def signed_message(kind: str, *, sender: str = "", receiver: str = "",
                    value: int = 0, signed_ts: float = 0.0,
                    nonce: int = 0, payload: str = ""):
-    # `value` is in SATS (int). The produced string is
     """The exact byte string the sender signs for each kind of action."""
     n = int(nonce)
     if kind == "TRANSFER":
@@ -2018,7 +2042,6 @@ def signed_message(kind: str, *, sender: str = "", receiver: str = "",
     if kind == "STAKE":
         return f"STAKE|{sender}|{sat_to_str8(value)}|{signed_ts:.6f}|{n}"
     if kind == "REGISTER":
-        # no value field -- the grant amount is fixed
         return f"REGISTER|{sender}|{signed_ts:.6f}|{n}"
     if kind == "UNSTAKE":
         return f"UNSTAKE|{sender}|{sat_to_str8(value)}|{signed_ts:.6f}|{n}"
@@ -2135,7 +2158,6 @@ def swap_feasibility(kind, sender, receiver, value, payload, chain_now):
         if lock["receiver"] != sender:
             raise _Reject("only the designated receiver may claim this lock")
         pre = str(d.get("preimage", "")).lower()
-        # STRICT canonical form: exactly 64 hex chars (32 bytes), hashed
         if len(pre) != 64 or any(c not in "0123456789abcdef" for c in pre):
             raise _Reject("preimage must be exactly 64 hex characters (32 bytes)")
         if hashlib.sha256(bytes.fromhex(pre)).hexdigest() != lock["hash_lock"]:
@@ -2167,18 +2189,89 @@ class _Reject(Exception):
 
 class Network:
     THETA_S = 0.15
-    THETA_W = 5.0    # lowered for a young network
+    THETA_W = 5.0
     THETA_I = 80.0
 
     def __init__(self):
-        self.nodes    = {}   # address -> Node (alive and dead)
+        self.nodes    = {}
         self.chain    = []
         self.mempool  = []
         self.eco      = Economy()
         self.emission = Emission()
         self.vesting  = Vesting()
+        self._alive_sorted_cache = []
+        self._alive_cache_dirty  = True
+        self._death_schedule = []
+        self._alive_energy_sum = 0.0
+        self._verified_up_to_index = -1
 
-    # -- Chain time ----------------------------
+    def _invalidate_alive_cache(self):
+        self._alive_cache_dirty = True
+
+    def _get_alive_sorted(self):
+        """Returns the sorted list of alive node addresses -- rebuilds
+        from scratch only if the alive set changed since the last call,
+        otherwise returns the cached list in O(1)."""
+        if self._alive_cache_dirty:
+            self._alive_sorted_cache = sorted(
+                addr for addr, n in self.nodes.items() if n.alive)
+            self._alive_cache_dirty = False
+        return self._alive_sorted_cache
+
+    def materialize_node(self, node, now_block: int):
+        """Bring a single node's energy/recent_activity up to date as of
+        now_block. Cheap (O(1)) -- call before any consensus-relevant read
+        of node.energy or node.recent_activity for a SPECIFIC node (e.g.
+        the selected validator's weight() check). Never loop this over
+        every alive node -- that's exactly the O(n)-per-block cost this
+        whole mechanism replaces."""
+        node.materialize(now_block)
+
+    def _schedule_death(self, node, now_block: int):
+        """(Re)schedules when `node` will die, given its CURRENT (already
+        materialized) energy. Must be called any time a node's energy
+        changes -- birth, rebirth, or any impulse that adds energy. The
+        old heap entry (if any) is left in place and becomes stale; stale
+        entries are detected and discarded cheaply in _process_deaths via
+        the scheduled_death_block comparison, not removed eagerly (heapq
+        has no cheap arbitrary-entry removal, and doesn't need one here)."""
+        if node.energy <= ENERGY_DEATH:
+            death_block = now_block
+        else:
+            blocks_needed = math.ceil((node.energy - ENERGY_DEATH) / ENERGY_DECAY_RATE)
+            death_block = now_block + blocks_needed
+        node.scheduled_death_block = death_block
+        heapq.heappush(self._death_schedule, (death_block, node.address))
+
+    def _process_deaths(self, now_block: int, now_time: float):
+        """Replaces the old _decay_all's O(n)-per-block sweep. Pops only
+        the (typically zero or very few) entries actually due at
+        now_block -- everyone else's decay is accounted for lazily,
+        exactly, whenever they're next touched or checked, never eagerly
+        recomputed here."""
+        while self._death_schedule and self._death_schedule[0][0] <= now_block:
+            death_block, address = heapq.heappop(self._death_schedule)
+            node = self.nodes.get(address)
+            if node is None or not node.alive:
+                continue
+            if node.scheduled_death_block != death_block:
+                continue
+            node.materialize(now_block)
+            if node.energy > ENERGY_DEATH:
+                self._schedule_death(node, now_block)
+                continue
+            node.alive   = False
+            self._alive_energy_sum -= node.energy
+            node.died_at = now_time
+            node.tx_count_at_death = db.get_tx_count(node.address)
+            node._save_inheritance()
+            db.log("NODE_DIED",
+                   f"{node.address[:16]} died | rep={node.reputation:.2f} risk={node.risk:.2f} "
+                   f"balance={node.balance:.2f} (held for one year)")
+            print(f"[NODE] {node.address[:16]}... died | balance {node.balance:.2f} BIO held for one year")
+            db.save_node(node)
+            self._invalidate_alive_cache()
+
     def chain_time(self) -> float:
         """The network's own notion of "now" -- the latest block's embedded timestamp, not this server's wall clock."""
         return self.chain[-1].t if self.chain else self.emission.start_time
@@ -2188,42 +2281,37 @@ class Network:
         with _chain_lock:
             return list(self.nodes.values())
 
-    # -- Biofield -----------------------------
     def phi_bio(self) -> float:
-        alive = [n for n in self.nodes_snapshot() if n.alive]
-        if not alive:
+        alive_count = len(self._get_alive_sorted())
+        if alive_count == 0:
             return 1.0
-        biofield = sum(n.energy for n in alive) * self.eco.stability()
+        biofield = self._alive_energy_sum * self.eco.stability()
         return biofield / 500.0
 
-    # -- Organic node emergence ----------------
     def _try_emerge(self, address: str, now: float):
         """Checks whether there is enough activity to birth/revive a node."""
         if address in self.nodes and self.nodes[address].alive:
-            return  # already a live node
+            return
 
         tx_count = db.get_tx_count(address)
 
-        # Birth of a new node
         if address not in self.nodes and tx_count >= EMERGE_THRESHOLD:
             wallet_row = db.get_wallet(address)
             first_seen = float(wallet_row["first_seen"]) if wallet_row else now
             if now - first_seen >= MIN_EMERGENCE_SPAN_SECONDS:
                 self._emerge(address, now, births=1)
 
-        # Rebirth of a dead node
         elif address in self.nodes and not self.nodes[address].alive:
             node = self.nodes[address]
             impulses_since_death = tx_count - node.tx_count_at_death
             if impulses_since_death >= REBIRTH_THRESHOLD:
-                # Read inheritance from events
                 import json
                 inheritance = self._load_inheritance(address)
                 node.alive   = True
                 node.births += 1
                 node.born_at = now
+                self._invalidate_alive_cache()
                 node.recent_activity = 0.0
-                # New life -- longevity clock resets
                 node.longevity_6mo_paid  = False
                 node.longevity_12mo_paid = False
                 node.last_monthly_payout = 0.0
@@ -2235,6 +2323,9 @@ class Network:
                     )
                 else:
                     node.energy = 15.0
+                node.state_block = len(self.chain)
+                self._schedule_death(node, node.state_block)
+                self._alive_energy_sum += node.energy
                 db.save_node(node)
                 db.log("NODE_REBORN", f"{address[:16]} reborn x{node.births}")
                 print(f"[NODE] {address[:16]}... reborn! (birth #{node.births})")
@@ -2258,30 +2349,32 @@ class Network:
         """Birth of a new node from an address"""
         tx_count = db.get_tx_count(address)
         node     = Node(address, births, now)
-        # The node is born already carrying its impulse history
         node.activity        = tx_count
-        node.recent_activity = float(tx_count)   # born with real history
+        node.recent_activity = float(tx_count)
         node.age             = round(tx_count * 0.1, 1)
         node.energy          = 10.0 + tx_count * ENERGY_PER_IMPULSE
+        node.state_block = len(self.chain)
         self.nodes[address] = node
-        # genesis grant applied before saving node.balance
+        self._schedule_death(node, node.state_block)
+        self._alive_energy_sum += node.energy
+        self._invalidate_alive_cache()
         self.emission.try_genesis_grant(address)
-        node.balance = db.get_balance(address)   # sync AFTER the grant
+        node.balance = db.get_balance(address)
         db.save_node(node)
         db.log("NODE_EMERGED", f"{address[:16]} emerged from {tx_count} impulses")
         print(f"[NODE] * {address[:16]}... EMERGED (after {tx_count} impulses | energy={node.energy:.1f} activity={node.activity})")
 
-    # -- Validator selection -- pure 50/50 ------
     def _select_validator(self, impulse):
         """Deterministic, verifiable selection -- replaces random.choice so that every peer, given the same chain state and the same impulse, computes the SAME validator."""
-        alive = sorted((v for v in self.nodes_snapshot() if v.alive), key=lambda n: n.address)
-        if not alive:
+        alive_sorted = self._get_alive_sorted()
+        if not alive_sorted:
             return None, None
         prev_hash = self.chain[-1].hash if self.chain else "0" * 64
         seed_input = f"{prev_hash}{impulse.id}".encode()
         seed_int = int(hashlib.sha256(seed_input).hexdigest(), 16)
-        index = seed_int % len(alive)
-        chosen = alive[index]
+        index = seed_int % len(alive_sorted)
+        chosen_address = alive_sorted[index]
+        chosen = self.nodes[chosen_address]
         return chosen.address, chosen
 
     @staticmethod
@@ -2317,17 +2410,17 @@ class Network:
             payload=getattr(impulse, "payload", "") or "",
         )
         if message is None:
-            return False  # unknown kind / unparseable payload -- never trust silently
+            return False
         return pq.verify(pubkey, message, signature_hex)
 
     def _can_finalize(self, validator, impulse) -> bool:
         if not validator:
             return False
+        validator.materialize(len(self.chain))
         S = self.eco.stability()
         W = validator.weight(self.eco.liquidity, self.eco.risk)
         return S > self.THETA_S and W > self.THETA_W and impulse.energy < self.THETA_I
 
-    # -- Main send method ----------------------
     def send(self, sender: str, receiver: str, value: float, pubkey_hex: str = "", signature_hex: str = "", signed_timestamp: float = 0.0, kind: str = "TRANSFER", payload: str = "", nonce: int = 0):
         """Submits an impulse -- a transfer, a stake/unstake request, a governance proposal, or a vote."""
         with _chain_lock:
@@ -2337,7 +2430,6 @@ class Network:
                 with db.transaction():
                     db.ensure_wallet(sender)
 
-                    # Spend the nonce + the local signature-replay guard
                     if len(self.mempool) >= MEMPOOL_MAX:
                         raise _Reject(f"mempool is full ({MEMPOOL_MAX}) -- try again shortly")
                     if payload and len(payload) > PAYLOAD_MAX_CHARS:
@@ -2359,7 +2451,6 @@ class Network:
                         if not db.debit(sender, total_debit):
                             raise _Reject(f"insufficient BIO: have {sat_to_bio(db.get_balance(sender)):.4f}, need {sat_to_bio(total_debit):.4f} ({sat_to_bio(value):.4f} stake + {sat_to_bio(Emission.STAKE_FEE):.4f} fee)")
                     elif kind == "REGISTER":
-                        # No debit -- this impulse CREDITS the sender, gated
                         wallet_row = db.get_wallet(sender)
                         if wallet_row and int(wallet_row["registration_got"]) == 1:
                             raise _Reject("this address already claimed its registration grant")
@@ -2396,52 +2487,60 @@ class Network:
                         if db.has_voted(data.get("proposal_id"), sender):
                             raise _Reject("already voted on this proposal")
                     elif kind in ("SWAP_OFFER", "SWAP_LOCK", "SWAP_CLAIM", "SWAP_REFUND"):
-                        # ONE shared rulebook with the peer path -- see
                         swap_feasibility(kind, sender, receiver, value, payload, time.time())
                     else:
                         raise _Reject(f"unknown action kind: {kind}")
 
-                    # Create the impulse
                     phi_bio_snap = self.phi_bio()
                     imp = Impulse(sender, receiver, value, len(self.chain), phi_bio_snap, pubkey_hex, signature_hex, signed_timestamp, kind, payload, nonce)
                     self.mempool.append(imp)
 
-                    # Process it
                     block, reason = self._mine()
 
                     if block:
                         self._after_block(block, sender, receiver, value)
             except _Reject as e:
-                # An expected validation failure. transaction() has already
-                self._restore_inmem(snap)
+                self._restore_inmem(snap, self._end_balance_recording())
                 return None, str(e)
             except Exception as e:
-                # realign in-memory state after rollback
-                self._restore_inmem(snap)
+                self._restore_inmem(snap, self._end_balance_recording())
                 return None, f"internal error while sending: {e}"
+            finally:
+                self._end_balance_recording()
+
+        if block and block.index > 0 and block.index % WAL_CHECKPOINT_EVERY == 0:
+            try:
+                db.wal_checkpoint()
+            except Exception as e:
+                db.log("WAL_CHECKPOINT_ERROR", f"block {block.index}: {e}")
+                print(f"[WAL] checkpoint failed at block {block.index}: {e}")
 
         return block, reason
 
     def _after_block(self, block, sender: str, receiver: str, value: float):
         """Everything that happens after ANY block is appended -- whether it was just created locally (send/_mine) or received and validated from a peer (see /peer/block)."""
-        # Emergence first -- then activity
+        now_block = len(self.chain)
         self._try_emerge(sender, block.t)
         if receiver != sender:
             self._try_emerge(receiver, block.t)
 
-        # Update activity (the node definitely exists by now)
         if sender in self.nodes and self.nodes[sender].alive:
+            _e_before = self.nodes[sender].energy
+            self.nodes[sender].materialize(now_block)
             self.nodes[sender].on_impulse_sent(value)
+            self._alive_energy_sum += self.nodes[sender].energy - _e_before
+            self._schedule_death(self.nodes[sender], now_block)
             db.save_node(self.nodes[sender])
-        # only a genuinely separate receiver gets the "received" bonus
         if receiver != sender and receiver in self.nodes and self.nodes[receiver].alive:
+            _e_before = self.nodes[receiver].energy
+            self.nodes[receiver].materialize(now_block)
             self.nodes[receiver].on_impulse_received(value)
+            self._alive_energy_sum += self.nodes[receiver].energy - _e_before
+            self._schedule_death(self.nodes[receiver], now_block)
             db.save_node(self.nodes[receiver])
 
-        # Energy decay for all nodes
-        self._decay_all(block.t)
+        self._process_deaths(now_block, block.t)
 
-        # Governance, longevity, and vesting are now driven by block
         try:
             _governance_tick(block.t)
         except Exception as e:
@@ -2494,8 +2593,33 @@ class Network:
         desired   = base * mult
         return min(desired, self.emission.pools["validators"])
 
+    def _begin_balance_recording(self):
+        global _balance_rollback_record, _balance_rollback_seen
+        _balance_rollback_record = []
+        _balance_rollback_seen = set()
+
+    def _end_balance_recording(self):
+        """Always safe to call, including a second time as a no-op safety
+        net (see the `finally` blocks at both call sites) -- returns the
+        recorded (node, old_balance) list exactly once, then clears the
+        global state so the NEXT transaction starts clean regardless of
+        whether this one succeeded or failed."""
+        global _balance_rollback_record, _balance_rollback_seen
+        if _balance_rollback_record is None:
+            return []
+        record = _balance_rollback_record
+        _balance_rollback_record = None
+        _balance_rollback_seen   = None
+        return record
+
     def _snapshot_inmem(self) -> dict:
-        """Captures the in-memory state that db.transaction()'s rollback does not cover."""
+        """Captures the in-memory state that db.transaction()'s rollback
+        does not cover, and starts balance-change recording (see
+        _begin_balance_recording / PERF FIX note above class Node) --
+        replaces copying every alive node's balance up front with
+        recording only whichever nodes this specific transaction actually
+        touches, wherever in the codebase that happens."""
+        self._begin_balance_recording()
         return {
             "chain_len":     len(self.chain),
             "em_pools":      dict(self.emission.pools),
@@ -2504,21 +2628,22 @@ class Network:
             "em_halvings":   self.emission.halvings,
             "em_start_time": self.emission.start_time,
             "eco_state":     dict(self.eco.__dict__),
-            "node_balances": {a: n.balance for a, n in self.nodes.items()},
         }
 
-    def _restore_inmem(self, snap: dict):
-        """Undoes whatever _snapshot_inmem captured -- the in-memory twin of a DB transaction rollback."""
+    def _restore_inmem(self, snap: dict, balance_record: list = None):
+        """Undoes whatever _snapshot_inmem captured, plus every recorded
+        balance change since -- the in-memory twin of a DB transaction
+        rollback. Pass the list from _end_balance_recording()."""
         del self.chain[snap["chain_len"]:]
+        self._verified_up_to_index = min(self._verified_up_to_index, len(self.chain) - 1)
         self.emission.pools      = snap["em_pools"]
         self.emission.minted     = snap["em_minted"]
         self.emission.burned     = snap["em_burned"]
         self.emission.halvings   = snap["em_halvings"]
         self.emission.start_time = snap["em_start_time"]
         self.eco.__dict__.update(snap["eco_state"])
-        for a, bal in snap["node_balances"].items():
-            if a in self.nodes:
-                self.nodes[a].balance = bal
+        for node, old_balance in (balance_record or []):
+            node._balance = old_balance
 
     def _apply_peer_block_locked(self, block_data: dict):
         try:
@@ -2529,7 +2654,7 @@ class Network:
 
                 sender    = block_data.get("imp_sender", "")
                 receiver  = block_data.get("imp_receiver", "")
-                value     = int(block_data.get("imp_value", 0))   # SATS
+                value     = int(block_data.get("imp_value", 0))
                 timestamp = float(block_data.get("timestamp", 0))
                 index     = int(block_data.get("index", -1))
                 kind      = block_data.get("imp_kind", "TRANSFER") or "TRANSFER"
@@ -2559,7 +2684,6 @@ class Network:
                 if not Network.verify_impulse_signature(imp):
                     raise _Reject("invalid sender signature")
 
-                # nonce and signature are consumed atomically
                 if not db.use_nonce(imp.sender, int(block_data.get("imp_nonce", 0))):
                     raise _Reject("nonce already used or not strictly increasing (replay rejected)")
                 if not db.use_signature_once(imp.signature_hex, imp.sender, time.time()):
@@ -2567,7 +2691,7 @@ class Network:
 
                 validator = block_data.get("validator", "")
                 if validator != "NETWORK":
-                    alive_addrs = [n.address for n in self.nodes_snapshot() if n.alive]
+                    alive_addrs = self._get_alive_sorted()
                     if not Network.verify_validator_selection(block_data["prev_hash"], imp.id, alive_addrs, validator):
                         raise _Reject("validator was not legitimately selected")
 
@@ -2582,14 +2706,12 @@ class Network:
                 if timestamp > time.time() + 120:
                     raise _Reject("block timestamp is too far in the future")
 
-                claimed_reward  = int(block_data.get("reward", 0))   # SATS
+                claimed_reward  = int(block_data.get("reward", 0))
                 expected_reward = self._expected_reward(validator, timestamp)
-                #  int money: EXACT equality. The old float tolerance
                 if claimed_reward != expected_reward:
                     raise _Reject(f"claimed reward {claimed_reward} sat does not match "
                                   f"deterministic recomputation {expected_reward} sat")
 
-                # ---- feasibility checks (still inside the transaction) ----
                 db.ensure_wallet(sender)
                 if kind == "TRANSFER":
                     fee = transfer_fee(value)
@@ -2639,12 +2761,10 @@ class Network:
                     if db.has_voted(vdata.get("proposal_id"), sender):
                         raise _Reject("already voted on this proposal")
                 elif kind in ("SWAP_OFFER", "SWAP_LOCK", "SWAP_CLAIM", "SWAP_REFUND"):
-                    # same rules as the local send() path
                     swap_feasibility(kind, sender, receiver, value, imp.payload, timestamp)
                 else:
                     raise _Reject(f"unknown impulse kind: {kind}")
 
-                # ---- no more rejections past this point: apply effects ----
                 snap = self._snapshot_inmem()
                 try:
                     self._apply_impulse_effect(imp)
@@ -2657,7 +2777,6 @@ class Network:
                     alive = [n for n in self.nodes_snapshot() if n.alive]
                     self.eco.update(imp.energy, self.emission, alive)
 
-                    # Use the value we already verified above
                     reward = expected_reward
                     if validator != "NETWORK" and reward > 0 and validator in self.nodes:
                         db.credit(validator, reward)
@@ -2668,10 +2787,9 @@ class Network:
                     block = _BlockStub(index, block_data["hash"], block_data["prev_hash"],
                                        validator, reward, timestamp, imp)
                     self.chain.append(block)
+                    self._demote_old_blocks()
                     if len(self.chain) == 1:
-                        # This is genesis -- anchor emission's halving clock
                         self.emission.start_time = block.t
-                        # Same anchor for vesting -- otherwise an isolated
                         self.vesting.start_time = block.t
                         db.set_vesting_start(block.t)
                     db.save_block(block)
@@ -2679,9 +2797,16 @@ class Network:
 
                     self._after_block(block, sender, receiver, value)
                 except Exception:
-                    # The DB rolls itself back via transaction(); restore
-                    self._restore_inmem(snap)
+                    self._restore_inmem(snap, self._end_balance_recording())
                     raise
+                finally:
+                    self._end_balance_recording()
+            if block and block.index > 0 and block.index % WAL_CHECKPOINT_EVERY == 0:
+                try:
+                    db.wal_checkpoint()
+                except Exception as e:
+                    db.log("WAL_CHECKPOINT_ERROR", f"block {block.index}: {e}")
+                    print(f"[WAL] checkpoint failed at block {block.index}: {e}")
             return True, "ok"
         except _Reject as e:
             return False, str(e)
@@ -2746,16 +2871,31 @@ class Network:
         imp = self.mempool[0]
         alive = [n for n in self.nodes_snapshot() if n.alive]
 
-        # No live nodes -- bootstrap mode
         if not alive:
             return self._bootstrap(imp)
 
         addr, validator = self._select_validator(imp)
         if not self._can_finalize(validator, imp):
-            # fall back to bootstrap rather than hard-rejecting
             return self._bootstrap(imp)
 
         return self._finalize(imp, addr, validator)
+
+    def _demote_old_blocks(self):
+        """PERF FIX (v5.43): called after every new block append during
+        live operation -- keeps only the most recent CHAIN_HOT_WINDOW
+        blocks as full objects; whichever one just aged out of the
+        window gets converted to a lightweight _LazyBlock. restore()
+        already gives a freshly-restarted server this same memory
+        saving for its whole history; this is what maintains it
+        continuously for a long-running server that never restarts.
+        O(1) per new block -- demotes exactly the one block that just
+        crossed the boundary, never rescans the whole chain."""
+        demote_index = len(self.chain) - CHAIN_HOT_WINDOW - 1
+        if demote_index >= 0:
+            old = self.chain[demote_index]
+            if not isinstance(old, _LazyBlock):
+                self.chain[demote_index] = _LazyBlock(
+                    old.index, old.hash, old.prev_hash, old.validator, old.reward, old.t)
 
     def _verify_chain_integrity(self) -> bool:
         """Checks chain integrity before adding a new block"""
@@ -2778,7 +2918,7 @@ class Network:
             self.emission.burn(fee)
             db.credit(imp.receiver, net_amt)
         elif imp.kind == "STAKE":
-            self.emission.burn(Emission.STAKE_FEE)   # flat fee, paid on top -- see STAKE_FEE
+            self.emission.burn(Emission.STAKE_FEE)
             existing     = db.get_stake(imp.sender)
             old_staked   = int(existing["bio_amount"]) if existing else 0
             total_staked = old_staked + imp.value
@@ -2787,7 +2927,6 @@ class Network:
             db.log("STAKE", f"{imp.sender[:16]} +{sat_to_bio(imp.value)} BIO staked -> {tier} (total {sat_to_bio(total_staked)})")
             print(f"[STAKE] {imp.sender[:16]}... +{sat_to_bio(imp.value)} BIO -> tier {tier}")
         elif imp.kind == "REGISTER":
-            # Atomic, idempotent -- see try_give_registration's own
             given = db.try_give_registration(imp.sender, WALLET_REGISTRATION_GRANT)
             if given > 0:
                 self.emission.pools["wallet_registration"] -= given
@@ -2812,7 +2951,7 @@ class Network:
                 print(f"[SWAP] {imp.sender[:16]}... offer cancelled")
             else:
                 give = int(data["give_bio"])
-                self.emission.burn(transfer_fee(give))   # debited in feasibility
+                self.emission.burn(transfer_fee(give))
                 db.create_swap_offer(imp.id, imp.sender, give, data["want_asset"],
                                      int(data["want_amount"]), str(data["ext_address"]),
                                      imp.t, int(data["ttl"]))
@@ -2820,7 +2959,7 @@ class Network:
                 print(f"[SWAP] {imp.sender[:16]}... OFFER {sat_to_bio(give)} BIO -> {data['want_asset']}")
         elif imp.kind == "SWAP_LOCK":
             data = json.loads(imp.payload)
-            self.emission.burn(transfer_fee(imp.value))  # value+fee debited in feasibility
+            self.emission.burn(transfer_fee(imp.value))
             db.create_swap_lock(imp.id, imp.sender, imp.receiver, imp.value,
                                 str(data["hash_lock"]).lower(), imp.t, int(data["timeout"]))
             db.log("SWAP_LOCK", f"{imp.sender[:16]} locked {sat_to_bio(imp.value)} BIO for {imp.receiver[:16]} (timeout {int(data['timeout'])} s)")
@@ -2855,7 +2994,6 @@ class Network:
                 db.log("VOTE", f"{imp.sender[:16]} {data['vote']} proposal #{data['proposal_id']}")
                 print(f"[VOTE] {imp.sender[:16]}... {data['vote']} proposal #{data['proposal_id']}")
             else:
-                # pre-checked before mining -- a duplicate vote is silently dropped
                 print(f"[VOTE] {imp.sender[:16]}... vote on #{data['proposal_id']} not counted (already voted)")
 
     def _bootstrap(self, imp):
@@ -2867,15 +3005,14 @@ class Network:
         self.eco.update(imp.energy, self.emission, alive)
 
         prev  = self.chain[-1].hash if self.chain else "0" * 64
-        block = Block(len(self.chain), prev, imp, "NETWORK", 0)   # sats (int)
+        block = Block(len(self.chain), prev, imp, "NETWORK", 0)
         self.chain.append(block)
+        self._demote_old_blocks()
         if len(self.chain) == 1:
-            # Genesis -- anchor the halving clock to the chain's own
             self.emission.start_time = block.t
             self.vesting.start_time  = block.t
             db.set_vesting_start(block.t)
 
-        # Integrity check after adding
         self._verify_chain_integrity()
 
         db.save_block(block)
@@ -2886,14 +3023,12 @@ class Network:
         """Processing with a validator"""
         self.mempool.pop(0)
 
-        # Reward is computed on the PRE-impulse validators pool, BEFORE
         reward = self.emission.mint_reward(validator, len(self.chain), imp.t)
         if reward > 0:
             db.credit(validator.address, reward)
 
         self._apply_impulse_effect(imp)
 
-        # sync node balances from the database
         if imp.sender in self.nodes:
             self.nodes[imp.sender].balance = db.get_balance(imp.sender)
         if imp.receiver in self.nodes:
@@ -2905,27 +3040,24 @@ class Network:
         prev  = self.chain[-1].hash if self.chain else "0" * 64
         block = Block(len(self.chain), prev, imp, addr, reward)
         self.chain.append(block)
+        self._demote_old_blocks()
         if len(self.chain) == 1:
-            # Defensive -- in practice genesis goes through _bootstrap
             self.emission.start_time = block.t
             self.vesting.start_time  = block.t
             db.set_vesting_start(block.t)
 
-        # Integrity check after adding
         self._verify_chain_integrity()
 
         db.save_block(block)
         db.save_node(validator)
         db.save_economy(self.eco, self.emission)
 
-        # Checkpoint every CHECKPOINT_EVERY blocks
         if block.index > 0 and block.index % CHECKPOINT_EVERY == 0:
             alive_count = sum(1 for n in self.nodes_snapshot() if n.alive)
             db.save_checkpoint(block.index, block.hash, alive_count)
             db.log("CHECKPOINT",
                    f"block {block.index} | hash={block.hash[:16]} | nodes={alive_count}")
             print(f"[CHECKPOINT] block {block.index} recorded | nodes={alive_count}")
-            # heavier state snapshot, only every STATE_SNAPSHOT_EVERY
             try:
                 maybe_create_state_snapshot(block.index)
             except Exception as e:
@@ -2934,19 +3066,8 @@ class Network:
 
         return block, "ok"
 
-    def _decay_all(self, now: float):
-        """After every block: - Energy decays (without activity a node dies) - recent_activity decays by 5% (without activity -> 0 in ~20 blocks) - Old history grants no."""
-        EMA_DECAY = 0.95   # 5% decay per block
-        for node in list(self.nodes_snapshot()):
-            if node.alive:
-                node.recent_activity = round(node.recent_activity * EMA_DECAY, 4)
-                node.decay()
-                node.check_alive(now)
-                db.save_node(node)
 
-    # -- Restore from database ---------------
     def restore(self):
-        # FIX 6: named columns
         eco_row = db.load_economy()
         if eco_row:
             self.eco.liquidity                 = eco_row["liquidity"]
@@ -2961,18 +3082,14 @@ class Network:
             self.emission.pools["team"]        = eco_row["pool_team"]
             self.emission.pools["genesis"]     = eco_row["pool_genesis"]
             self.emission.pools["listing_reserve"] = eco_row["pool_listing_reserve"]
-            # restore the wallet_registration pool -- THE critical
             if "pool_wallet_registration" in eco_row.keys():
                 self.emission.pools["wallet_registration"] = eco_row["pool_wallet_registration"]
-            # restore total_destroyed -- without this, every
             if "total_destroyed" in eco_row.keys():
                 self.emission.total_destroyed = eco_row["total_destroyed"]
             if "pool_developer_grants" in eco_row.keys():
                 self.emission.pools["developer_grants"] = eco_row["pool_developer_grants"]
-            # restore server_rewards -- THE critical counterpart
             if "pool_server_rewards" in eco_row.keys():
                 self.emission.pools["server_rewards"] = eco_row["pool_server_rewards"]
-            # Restore the emission start time
             if eco_row["emission_start"] and eco_row["emission_start"] > 0:
                 self.emission.start_time = eco_row["emission_start"]
 
@@ -2990,7 +3107,6 @@ class Network:
             node.died_at         = row["died_at"]
             node.role            = row["role"] or "VALIDATOR"
             node.risk            = row["risk"] or 0.0
-            # guard against an old DB schema without longevity columns
             row_keys = row.keys()
             node.longevity_6mo_paid  = bool(row["longevity_6mo"])  if "longevity_6mo"  in row_keys else False
             node.longevity_12mo_paid = bool(row["longevity_12mo"]) if "longevity_12mo" in row_keys else False
@@ -2998,39 +3114,66 @@ class Network:
             node.tx_count_at_death   = (row["tx_count_at_death"] or 0)   if "tx_count_at_death" in row_keys else 0
             node.inherited_rep       = (row["inherited_rep"] or 0.0)     if "inherited_rep"     in row_keys else 0.0
             node.inherited_risk      = (row["inherited_risk"] or 0.0)    if "inherited_risk"    in row_keys else 0.0
+            node.state_block = (row["state_block"] or 0) if "state_block" in row_keys else 0
             self.nodes[addr]     = node
 
         alive  = sum(1 for n in self.nodes_snapshot() if n.alive)
         dead   = len(self.nodes) - alive
         print(f"[DB] Restored {len(self.nodes)} nodes ({alive} alive, {dead} dead)")
 
-        # Restore the block chain
-        for row in db.load_blocks():
-            imp = _ImpulseStub(
-                row["imp_sender"],   row["imp_receiver"],
-                row["imp_value"],    row["imp_energy"],
-                row["imp_phi_bio"],  row["imp_id"],
-                row["timestamp"],
-                row["imp_pubkey"],   row["imp_signature"],
-                row["imp_signed_ts"], row["imp_kind"], row["imp_payload"],
-                row["imp_nonce"] or 0,
-            )
-            block = _BlockStub(
-                row["idx"],         row["hash"],
-                row["prev_hash"],   row["validator"],
-                row["reward"],      row["timestamp"],
-                imp,
-            )
+        _chain_integrity_ok = True
+        total_blocks = db.count_blocks_table()
+        hot_window_start = max(0, total_blocks - CHAIN_HOT_WINDOW)
+        _cold_count = 0
+        for row in db.load_blocks_streaming():
+            idx = row["idx"]
+            if idx >= hot_window_start:
+                imp = _impulse_from_row(row)
+                block = _BlockStub(
+                    idx,                 row["hash"],
+                    row["prev_hash"],   row["validator"],
+                    row["reward"],      row["timestamp"],
+                    imp,
+                )
+            else:
+                block = _LazyBlock(
+                    idx,                 row["hash"],
+                    row["prev_hash"],   row["validator"],
+                    row["reward"],      row["timestamp"],
+                )
+                _cold_count += 1
+            if _chain_integrity_ok and self.chain and block.prev_hash != self.chain[-1].hash:
+                print(f"[DB][WARNING] chain integrity break detected at block "
+                      f"{len(self.chain)} during restore -- /verify will "
+                      f"report this via its own full scan")
+                _chain_integrity_ok = False
             self.chain.append(block)
+        if _chain_integrity_ok:
+            self._verified_up_to_index = len(self.chain) - 1
         if self.chain:
-            print(f"[DB] Restored {len(self.chain)} blocks in the chain")
-            # self-heal emission_start if it drifted from genesis
+            print(f"[DB] Restored {len(self.chain)} blocks in the chain "
+                  f"({_cold_count} cold/lazy, {len(self.chain)-_cold_count} hot/full)")
             if abs(self.emission.start_time - self.chain[0].t) > 1e-6:
                 self.emission.start_time = self.chain[0].t
-            # same self-heal for vesting start
             if abs(self.vesting.start_time - self.chain[0].t) > 1e-6:
                 self.vesting.start_time = self.chain[0].t
                 db.set_vesting_start(self.chain[0].t)
+
+        now_block = len(self.chain)
+        legacy_corrected = 0
+        for node in self.nodes.values():
+            if not node.alive:
+                continue
+            if node.state_block == 0 and now_block > 0:
+                node.state_block = now_block
+                legacy_corrected += 1
+            self._schedule_death(node, node.state_block)
+            self._alive_energy_sum += node.energy
+        if legacy_corrected:
+            print(f"[DB] {legacy_corrected} node(s) had their decay clock "
+                  f"anchored to the current restore point (pre-migration rows)")
+        print(f"[DB] death schedule rebuilt: {len(self._death_schedule)} entries, "
+              f"alive-energy sum: {self._alive_energy_sum:.1f}")
 
     def state(self) -> dict:
         alive = [n for n in self.nodes_snapshot() if n.alive]
@@ -3071,7 +3214,7 @@ class Network:
                 except Exception:
                     pass
                 return 0
-            return 0     # UNSTAKE / PROPOSAL / VOTE / SWAP_CLAIM / SWAP_REFUND -- free (sats)
+            return 0
 
         return [
             {
@@ -3086,7 +3229,6 @@ class Network:
                     "value":    sat_to_bio(b.impulse.value),
                     "energy":   round(b.impulse.energy,   4),
                     "phi_bio":  round(b.impulse.phi_bio,  6),
-                    # the fee actually charged for this specific kind
                     "fee":      round(sat_to_bio(fee_for(b.impulse)), 6),
                 },
             }
@@ -3101,10 +3243,9 @@ def _replay_candidate_chain(candidate_blocks: list):
     db = Database(temp_path)
     try:
         temp_net = Network()
-        _apply_founder_grant(temp_net)   # re-seed the founder grant BEFORE
+        _apply_founder_grant(temp_net)
         _fund_developer_grants_pool(temp_net)
-        _fund_wallet_registration_pool(temp_net)   # same reasoning
-        # a REGISTER impulse being replayed here would be wrongly rejected
+        _fund_wallet_registration_pool(temp_net)
         for block_data in candidate_blocks:
             ok, reason = temp_net._apply_peer_block_locked(block_data)
             if not ok:
@@ -3114,15 +3255,13 @@ def _replay_candidate_chain(candidate_blocks: list):
         db.conn.close()
         db = saved_db
 
-# INITIALIZATION
-FOUNDER_GRANT = 10000 * SAT_PER_BIO   # sats, not BIO
+FOUNDER_GRANT = 10000 * SAT_PER_BIO
 
-WALLET_REGISTRATION_GRANT     = 10 * SAT_PER_BIO   # sats, per new wallet
-WALLET_REGISTRATION_MAX_COUNT = 100                 # first N wallet registrations
-WALLET_REGISTRATION_POOL_SIZE = WALLET_REGISTRATION_GRANT * WALLET_REGISTRATION_MAX_COUNT  # 1,000 BIO
+WALLET_REGISTRATION_GRANT     = 10 * SAT_PER_BIO
+WALLET_REGISTRATION_MAX_COUNT = 100
+WALLET_REGISTRATION_POOL_SIZE = WALLET_REGISTRATION_GRANT * WALLET_REGISTRATION_MAX_COUNT
 
 def _apply_founder_grant(target_net) -> int:
-    # returns SATS granted
     """Developer's starting balance -- drawn from the genesis pool's own unassigned remainder, not minted on top of the 21,000,000 cap."""
     if db.count_blocks() > 0:
         return 0
@@ -3141,7 +3280,6 @@ def _apply_founder_grant(target_net) -> int:
 
 
 def _fund_wallet_registration_pool(target_net) -> int:
-    # returns SATS carved (0 if already funded or founder can't cover it)
     """moves WALLET_REGISTRATION_POOL_SIZE (1,000 BIO) out of the founder's own wallet into the wallet_registration pool -- literally "from the founder's 10,000", not."""
     if target_net.emission.pools.get("wallet_registration", 0) > 0:
         return 0
@@ -3150,10 +3288,9 @@ def _fund_wallet_registration_pool(target_net) -> int:
         print(f"[FOUNDER] could not fund wallet_registration pool -- "
               f"{TEAM_ADDRESS} balance below {sat_to_bio(carve)} BIO")
         return 0
-    # keep node.balance in sync with the wallets table
     if TEAM_ADDRESS in target_net.nodes:
         target_net.nodes[TEAM_ADDRESS].balance = db.get_balance(TEAM_ADDRESS)
-        db.save_node(target_net.nodes[TEAM_ADDRESS])   # persist to the nodes table too
+        db.save_node(target_net.nodes[TEAM_ADDRESS])
     target_net.emission.pools["wallet_registration"] = \
         target_net.emission.pools.get("wallet_registration", 0) + carve
     db.save_economy(target_net.eco, target_net.emission)
@@ -3200,13 +3337,10 @@ else:
     print(f"[BIOCHAIN] Nodes are born after {EMERGE_THRESHOLD} impulses from an address")
     _apply_founder_grant(net)
 
-_fund_developer_grants_pool(net)      # same reasoning, pool-to-pool
-_fund_server_rewards_pool(net)        # splits developer_grants in
-# half, runs immediately after it every startup -- see the function's
-_fund_wallet_registration_pool(net)   # runs on every startup, not just
-# fresh-genesis -- see the function's own docstring for why it's decoupled
+_fund_developer_grants_pool(net)
+_fund_server_rewards_pool(net)
+_fund_wallet_registration_pool(net)
 
-# repair pass: keep TEAM_ADDRESS node.balance in sync
 if TEAM_ADDRESS in net.nodes:
     _wallet_bal = db.get_balance(TEAM_ADDRESS)
     if net.nodes[TEAM_ADDRESS].balance != _wallet_bal:
@@ -3216,7 +3350,6 @@ if TEAM_ADDRESS in net.nodes:
         net.nodes[TEAM_ADDRESS].balance = _wallet_bal
         db.save_node(net.nodes[TEAM_ADDRESS])
 
-# restore parameters changed by governance in past sessions
 _overrides = db.get_param_overrides()
 if _overrides:
     print(f"[GOV] Restoring {len(_overrides)} parameter(s) from past decisions...")
@@ -3227,7 +3360,6 @@ if _overrides:
         else:
             print(f"[GOV] failed to restore {row['key']}: {msg}")
 
-# restore auto-promoted peers -- a promotion earned through
 _promoted = db.load_promoted_peers()
 if _promoted:
     _new_peers = [p for p in _promoted if p not in PEER_URLS]
@@ -3261,7 +3393,6 @@ def sync_with_peer(peer_url: str):
             PEER_URLS.remove(peer_url)
         return
 
-    # genesis-hash check -- confirms this peer is even talking
     their_genesis = info.get("genesis_hash", "")
     my_genesis    = net.chain[0].hash if net.chain else ""
     if their_genesis and my_genesis and their_genesis != my_genesis:
@@ -3273,7 +3404,7 @@ def sync_with_peer(peer_url: str):
     their_len = info.get("chain_len", 0)
     my_len    = len(net.chain)
     if their_len <= my_len:
-        return  # we are not behind this peer
+        return
 
     print(f"[PEER] {peer_url} has {their_len} blocks, we have {my_len} -- catching up")
     try:
@@ -3321,14 +3452,14 @@ def fast_sync_from_snapshot(peer_url: str) -> bool:
     if not HTTP_OK:
         return False
     if net.chain:
-        return False   # only meaningful for a genuinely fresh node
+        return False
     try:
         info = http_requests.get(f"{peer_url}/peer/chain_info", timeout=PEER_REQUEST_TIMEOUT_SECONDS).json()
         if info.get("instance_id") == INSTANCE_ID:
             print(f"[FASTSYNC] {peer_url} IS this server (own instance_id) -- skipping")
             return False
     except Exception:
-        pass   # unreachable is handled normally by the checkpoints fetch below
+        pass
     try:
         ckpts = http_requests.get(f"{peer_url}/checkpoints",
                                   timeout=PEER_REQUEST_TIMEOUT_SECONDS).json()
@@ -3351,14 +3482,12 @@ def fast_sync_from_snapshot(peer_url: str) -> bool:
         print(f"[FASTSYNC] peer error for snapshot {height}: {resp['error']}")
         return False
     snapshot = resp["snapshot"]
-    # STEP 3 (spec 6): recompute independently -- never trust resp["state_hash"]
     recomputed = canonical_state_hash(snapshot)
     if recomputed != claimed_hash:
         print(f"[FASTSYNC] HASH MISMATCH at height {height} -- "
               f"claimed={claimed_hash[:16]} recomputed={recomputed[:16]} -- "
               f"REJECTING snapshot entirely, falling back to full replay")
         return False
-    # hash confirmed -- load atomically into a fresh temp DB, then swap
     try:
         with db.lock:
             db.conn.execute("BEGIN IMMEDIATE")
@@ -3393,9 +3522,8 @@ def peer_sync_loop():
                 print(f"[PEER] sync error with {peer_url}: {e}")
         time.sleep(PEER_SYNC_INTERVAL_SECONDS)
 
-GOSSIP_INTERVAL_SECONDS  = 3600      # spec  section 4.2: candidate
-                                       # about candidate-list gossip
-CANDIDATE_PRUNE_INTERVAL_SECONDS = 86400   # once a day is plenty
+GOSSIP_INTERVAL_SECONDS  = 3600
+CANDIDATE_PRUNE_INTERVAL_SECONDS = 86400
 
 def promotion_threshold() -> int:
     """the number of DISTINCT trusted peers that must independently confirm a candidate before it's auto-promoted into PEER_URLS."""
@@ -3416,7 +3544,7 @@ def try_promote_candidate(url: str, confirmations: int) -> bool:
                       f"(own instance_id), despite {confirmations} gossip confirmation(s)")
                 return False
         except Exception:
-            pass   # fail-open: see docstring -- ambiguity never blocks promotion
+            pass
     promoted = db.save_promoted_peer(url, confirmations)
     if promoted:
         PEER_URLS.append(url)
@@ -3440,10 +3568,10 @@ def gossip_with_peers():
             continue
         heard = set(resp.get("trusted_peers", [])) | \
                 {c["url"] for c in resp.get("candidates", [])}
-        heard -= set(PEER_URLS)   # don't bother tracking peers we already trust
-        heard.discard(peer_url)    # a peer telling us about itself isn't a new candidate
+        heard -= set(PEER_URLS)
+        heard.discard(peer_url)
         if SELF_URL:
-            heard.discard(SELF_URL)   # a peer trusting us will mention us too
+            heard.discard(SELF_URL)
         for url in heard:
             try:
                 db.note_node_candidate(url, reporter_url=peer_url)
@@ -3452,7 +3580,6 @@ def gossip_with_peers():
         if heard:
             print(f"[GOSSIP] {peer_url} mentioned {len(heard)} node(s) we don't already trust")
 
-    # Promotion pass: once, after every peer this round has had a chance
     try:
         for candidate in db.list_node_candidates(min_confirmations=1):
             try_promote_candidate(candidate["url"], candidate["confirmations"])
@@ -3476,7 +3603,6 @@ def gossip_loop():
         time.sleep(GOSSIP_INTERVAL_SECONDS)
 
 if PEER_URLS:
-    # try fast-sync before falling back to block-by-block sync
     for _peer in PEER_URLS:
         try:
             if fast_sync_from_snapshot(_peer):
@@ -3519,16 +3645,14 @@ def _governance_tick(now: float):
             db.log("GOVERNANCE_APPLIED" if ok else "GOVERNANCE_FAILED", f"#{pid} {msg}")
             print(f"[GOV] #{pid} {'APPLIED' if ok else 'ERROR'}: {msg}")
 
-# governance_loop() removed -- _governance_tick() is now called directly
 
-# LONGEVITY -- REWARDS FOR A LONG ACTIVE LIFE
-LONGEVITY_6MO_DAYS       = 182.5    # half a year
-LONGEVITY_12MO_DAYS      = 365.0    # one year
-LONGEVITY_6MO_REWARD     = 10  * SAT_PER_BIO   # sats, one-time
-LONGEVITY_12MO_REWARD    = 100 * SAT_PER_BIO   # sats, one-time
-LONGEVITY_MONTHLY_REWARD = 21.0     # BIO, every month after the first year
+LONGEVITY_6MO_DAYS       = 182.5
+LONGEVITY_12MO_DAYS      = 365.0
+LONGEVITY_6MO_REWARD     = 10  * SAT_PER_BIO
+LONGEVITY_12MO_REWARD    = 100 * SAT_PER_BIO
+LONGEVITY_MONTHLY_REWARD = 21.0
 LONGEVITY_MONTH_DAYS     = 30.0
-DEATH_SWEEP_DAYS         = 365.0    # one year without rebirth -> balance to pool
+DEATH_SWEEP_DAYS         = 365.0
 
 def _longevity_tick(now: float):
     """A single pass checking all nodes, using the chain's own time (not this server's wall clock -- see Network.chain_time)."""
@@ -3562,7 +3686,6 @@ def _longevity_tick(now: float):
             elif n.longevity_12mo_paid:
                 days_since = (now - n.last_monthly_payout) / 86400
                 if days_since >= LONGEVITY_MONTH_DAYS:
-                    # reward value is voted in BIO, applied in sats
                     monthly_sat = bio_to_sat(LONGEVITY_MONTHLY_REWARD)
                     if net.emission.pools["ecosystem"] >= monthly_sat:
                         net.emission.pools["ecosystem"] -= monthly_sat
@@ -3574,9 +3697,8 @@ def _longevity_tick(now: float):
                         db.log("LONGEVITY_MONTHLY", f"{n.address[:16]} +{LONGEVITY_MONTHLY_REWARD} BIO")
                         print(f"[LONGEVITY] {n.address[:16]}... +{LONGEVITY_MONTHLY_REWARD} BIO (monthly)")
         else:
-            # Dead node -- one year without rebirth -> balance to the ecosystem pool
             if n.died_at > 0 and (now - n.died_at) / 86400 >= DEATH_SWEEP_DAYS:
-                bal = db.get_balance(n.address)   # sats (int)
+                bal = db.get_balance(n.address)
                 if bal > 0 and db.debit(n.address, bal):
                     net.emission.pools["ecosystem"] += bal
                     n.balance = 0
@@ -3600,49 +3722,47 @@ def _unstake_tick(now: float):
             db.log("UNSTAKE_CLAIMED", f"{row['address'][:16]} +{sat_to_bio(amount_sat):.2f} BIO (cooldown complete)")
             print(f"[UNSTAKE] {row['address'][:16]}... +{sat_to_bio(amount_sat):.2f} BIO -- cooldown complete")
 
-# longevity_loop() removed -- _longevity_tick() is now called directly
 
-# MODELS
 class TXBody(BaseModel):
     sender:    str
     receiver:  str
     value:     float
-    pubkey:    str     # hex-encoded ML-DSA-44 public key of the sender
-    signature: str     # hex-encoded signature over "TX|sender|receiver|value|timestamp|nonce"
-    timestamp: float   # unix time when the request was signed (client clock)
-    nonce:     int = 0 # sender's own strictly-increasing counter -- see /nonce/{address}
+    pubkey:    str
+    signature: str
+    timestamp: float
+    nonce:     int = 0
 
 class BalanceBody(BaseModel):
-    address: str   # read-only lookup -- no signature needed, nothing moves
+    address: str
 
 class SwapOfferBody(BaseModel):
     address:     str
-    give_bio:    float = 0     # BIO offered (0 when cancelling)
-    want_asset:  str   = ""   # no default -- must be provided explicitly; empty is rejected by swap_feasibility
-    want_amount: int   = 0     # min units of the external asset (BTC: satoshi)
+    give_bio:    float = 0
+    want_asset:  str   = ""
+    want_amount: int   = 0
     ext_address: str   = ""
-    ttl:         int   = 0     # seconds
-    cancel_offer_id: str = ""  # set -> this is a cancellation
+    ttl:         int   = 0
+    cancel_offer_id: str = ""
     pubkey:      str
     signature:   str
     timestamp:   float
     nonce:       int = 0
 
 class SwapLockBody(BaseModel):
-    address:    str            # sender (locker)
-    receiver:   str            # counterparty who may claim
-    bio_amount: float          # BIO to lock
-    hash_lock:  str            # 64 hex -- SHA-256 of the initiator's preimage
-    timeout:    int            # seconds of chain-time
+    address:    str
+    receiver:   str
+    bio_amount: float
+    hash_lock:  str
+    timeout:    int
     pubkey:     str
     signature:  str
     timestamp:  float
     nonce:      int = 0
 
 class SwapSettleBody(BaseModel):
-    address:   str             # claimer (for CLAIM) / locker (for REFUND)
+    address:   str
     lock_id:   str
-    preimage:  str = ""        # CLAIM only: 64 hex
+    preimage:  str = ""
     pubkey:    str
     signature: str
     timestamp: float
@@ -3650,21 +3770,20 @@ class SwapSettleBody(BaseModel):
 
 class StakeBody(BaseModel):
     address:    str
-    bio_amount: float   # amount of BIO to stake
+    bio_amount: float
     pubkey:     str
-    signature:  str     # over "STAKE|address|bio_amount|timestamp|nonce"
+    signature:  str
     timestamp:  float
     nonce:      int = 0
 
 class RegisterBody(BaseModel):
     address:    str
     pubkey:     str
-    signature:  str     # over "REGISTER|address|timestamp|nonce"
+    signature:  str
     timestamp:  float
     nonce:      int = 0
 
 class ClaimServerRewardBody(BaseModel):
-    # this body is only kept so /claim_server_reward can still
     address:    str = ""
     url:        str = ""
     pubkey:     str = ""
@@ -3674,25 +3793,24 @@ class ClaimServerRewardBody(BaseModel):
 
 class UnstakeBody(BaseModel):
     address:    str
-    bio_amount: float   # amount to unstake -- immediately leaves the active
-                          # stake (tier drops right away), but the BIO itself
+    bio_amount: float
     pubkey:     str
-    signature:  str     # over "UNSTAKE|address|bio_amount|timestamp|nonce"
+    signature:  str
     timestamp:  float
     nonce:      int = 0
 
 class VoteBody(BaseModel):
     proposal_id: int
     voter:       str
-    vote:        str       # "FOR" or "AGAINST"
+    vote:        str
     pubkey:      str
-    signature:   str       # over "VOTE|proposal_id|voter|vote|timestamp|nonce"
+    signature:   str
     timestamp:   float
     nonce:       int = 0
 
 class LoanRequestBody(BaseModel):
     address:           str
-    collateral_type:   str    # "BTC" or "ETH" -- not yet functional
+    collateral_type:   str
     collateral_amount: float
     bio_requested:     float
     pubkey:            str
@@ -3705,14 +3823,13 @@ class ProposalBody(BaseModel):
     description:   str = ""
     proposer:      str
     duration_days: int = 7
-    param_key:     str = ""    # the parameter being changed
-    param_value:   str = ""    # the new value
+    param_key:     str = ""
+    param_value:   str = ""
     pubkey:        str = ""
-    signature:     str = ""    # over "PROPOSAL|proposer|title|param_key|param_value|timestamp|nonce"
+    signature:     str = ""
     timestamp:     float = 0.0
     nonce:         int = 0
 
-# API
 
 @app.post("/tx")
 def tx(body: TXBody):
@@ -3726,21 +3843,18 @@ def tx(body: TXBody):
     if body.sender == body.receiver:
         return {"error": "Sender and receiver are the same"}
 
-    value_sat = bio_to_sat(body.value)   # boundary IN -- ints from here on
+    value_sat = bio_to_sat(body.value)
     message = signed_message("TRANSFER", sender=body.sender, receiver=body.receiver,
                              value=value_sat, signed_ts=body.timestamp, nonce=body.nonce)
     ok, err = verify_signed_request(body.sender, body.pubkey, body.signature, message, body.timestamp)
     if not ok:
         return {"error": f"Unauthorized: {err}"}
 
-    # Rate limiting runs BEFORE the nonce is spent -- a throttled request
     if not rate_limiter.check(body.sender):
         return {"error": f"Rate limit exceeded: max {RATE_LIMIT_PER_MIN} transactions per minute"}
 
-    # The nonce + signature are now spent INSIDE net.send's own DB
     block, reason = net.send(body.sender, body.receiver, value_sat, body.pubkey, body.signature, body.timestamp, nonce=body.nonce)
 
-    # Check progress toward node emergence
     tx_count = db.get_tx_count(body.sender)
     to_emerge = max(0, EMERGE_THRESHOLD - tx_count)
     sender_is_node = body.sender in net.nodes
@@ -3860,9 +3974,7 @@ def vesting():
     state["balance"] = round(sat_to_bio(db.get_balance(TEAM_ADDRESS)), 2)
     return state
 
-# STATE SNAPSHOTS 
 
-# Fixed, alphabetical table order -- part of the canonical form (spec 4).
 SNAPSHOT_TABLES = [
     "address_nonces", "economy", "loans", "nodes", "param_overrides",
     "pending_unstakes", "proposals", "recognized_pairs", "stakes",
@@ -3952,19 +4064,18 @@ def peer_snapshot(height: int):
 def verify():
     if not net.chain:
         return {"valid": True, "message": "chain is empty", "blocks": 0}
-    for i, block in enumerate(net.chain):
-        if i > 0 and block.prev_hash != net.chain[i-1].hash:
+    start = max(net._verified_up_to_index + 1, 1)
+    for i in range(start, len(net.chain)):
+        if net.chain[i].prev_hash != net.chain[i-1].hash:
             return {"valid": False, "message": f"block {i}: broken link"}
-    # Supply invariant: sum of every wallet balance plus every emission
+    net._verified_up_to_index = len(net.chain) - 1
     wallets_total = int(db.conn.execute(
         "SELECT COALESCE(SUM(balance),0) s FROM wallets").fetchone()["s"])
-    locked_total = db.locked_total()   # sats held in active swap locks
-    staked_total = db.staked_total()   # BIO debited from the wallet on /stake
-    pending_unstakes_total = db.pending_unstakes_total()   # a
-    # fifth bucket: BIO mid-cooldown after UNSTAKE
+    locked_total = db.locked_total()
+    staked_total = db.staked_total()
+    pending_unstakes_total = db.pending_unstakes_total()
     grand_total = (wallets_total + sum(int(v) for v in net.emission.pools.values())
                    + locked_total + staked_total + pending_unstakes_total)
-    #  int money: the invariant is EXACT, to the sat -- both directions.
     max_supply_sat = Emission.MAX_SUPPLY * SAT_PER_BIO - net.emission.total_destroyed
     if grand_total != max_supply_sat:
         diff = grand_total - max_supply_sat
@@ -3981,7 +4092,6 @@ def verify():
                         f"({sat_to_bio(net.emission.total_destroyed):,.4f} BIO permanently destroyed via fee burning)",
     }
 
-# PEER -- for other independent servers, not wallets
 
 class PeerBlockBody(BaseModel):
     index:          int
@@ -4028,7 +4138,6 @@ def peer_known_nodes():
 
 class AnnounceBody(BaseModel):
     url: str
-    # the claimant_address/pubkey/signature/claim_timestamp
 
 @app.post("/peer/announce")
 def peer_announce(body: AnnounceBody):
@@ -4049,7 +4158,6 @@ def peer_announce(body: AnnounceBody):
     except Exception as e:
         return {"error": f"liveness check failed: {e}"}
 
-    # cryptographic self-check -- see the INSTANCE_ID block
     if resp.get("instance_id") == INSTANCE_ID:
         return {"error": "cannot announce this node's own URL to itself"}
 
@@ -4086,7 +4194,6 @@ def db_status():
                      for e in db.recent_events(10)],
     }
 
-# STAKE -- BIO COLLATERAL
 
 @app.post("/stake")
 def stake(body: StakeBody):
@@ -4097,14 +4204,13 @@ def stake(body: StakeBody):
     if body.bio_amount <= 0:
         return {"error": "Amount must be positive"}
 
-    amount_sat = bio_to_sat(body.bio_amount)   # boundary IN
+    amount_sat = bio_to_sat(body.bio_amount)
     message = signed_message("STAKE", sender=address, value=amount_sat,
                              signed_ts=body.timestamp, nonce=body.nonce)
     ok, err = verify_signed_request(address, body.pubkey, body.signature, message, body.timestamp)
     if not ok:
         return {"error": f"Unauthorized: {err}"}
 
-    # nonce + signature are spent inside net.send's transaction now
 
     block, reason = net.send(address, address, amount_sat, body.pubkey, body.signature, body.timestamp, kind="STAKE", nonce=body.nonce)
     if not block:
@@ -4169,14 +4275,13 @@ def unstake(body: UnstakeBody):
     if body.bio_amount <= 0:
         return {"error": "Amount must be positive"}
 
-    amount_sat = bio_to_sat(body.bio_amount)   # boundary IN
+    amount_sat = bio_to_sat(body.bio_amount)
     message = signed_message("UNSTAKE", sender=address, value=amount_sat,
                              signed_ts=body.timestamp, nonce=body.nonce)
     ok, err = verify_signed_request(address, body.pubkey, body.signature, message, body.timestamp)
     if not ok:
         return {"error": f"Unauthorized: {err}"}
 
-    # nonce + signature are spent inside net.send's transaction now
 
     block, reason = net.send(address, address, amount_sat, body.pubkey, body.signature, body.timestamp, kind="UNSTAKE", nonce=body.nonce)
     if not block:
@@ -4200,9 +4305,8 @@ def unstake(body: UnstakeBody):
 def loan_request(body: LoanRequestBody):
     """Scaffolding for credit against external collateral (BTC/ETH) -- deliberately NOT functional yet."""
     address = body.address.strip()
-    # same canonical int formatting as every other signed kind.
-    coll_sat = bio_to_sat(body.collateral_amount)   # 1e-8 units of BTC/ETH
-    req_sat  = bio_to_sat(body.bio_requested)       # sats of BIO
+    coll_sat = bio_to_sat(body.collateral_amount)
+    req_sat  = bio_to_sat(body.bio_requested)
     message = (f"LOAN|{address}|{body.collateral_type}|{sat_to_str8(coll_sat)}"
                f"|{sat_to_str8(req_sat)}|{body.timestamp:.6f}")
     ok, err = verify_signed_request(address, body.pubkey, body.signature, message, body.timestamp)
@@ -4256,7 +4360,6 @@ def get_stakes():
                       "reward_mult": v["reward_mult"]} for k, v in STAKE_TIERS.items()},
     }
 
-# HTLC ATOMIC SWAPS 
 
 @app.post("/swap/offer")
 def swap_offer(body: SwapOfferBody):
@@ -4269,7 +4372,6 @@ def swap_offer(body: SwapOfferBody):
     else:
         payload = json.dumps({
             "give_bio":    bio_to_sat(body.give_bio),
-            #  patch: NO .upper() here -- this transforms the payload
             "want_asset":  body.want_asset.strip(),
             "want_amount": int(body.want_amount),
             "ext_address": body.ext_address.strip(),
@@ -4380,7 +4482,6 @@ def swaps_locks(address: str = ""):
          "expires_in": max(0, int(r["created_t"] + r["timeout"] - now)) if r["state"] == "LOCKED" else 0,
         } for r in rows]}
 
-# GOVERNANCE -- VOTING
 
 @app.post("/proposals")
 def create_proposal(body: ProposalBody):
@@ -4400,13 +4501,11 @@ def create_proposal(body: ProposalBody):
     if not ok:
         return {"error": f"Unauthorized: {err}"}
 
-    # nonce + signature are spent inside net.send's transaction now
 
     block, reason = net.send(address, address, 0.0, body.pubkey, body.signature, body.timestamp, kind="PROPOSAL", payload=payload, nonce=body.nonce)
     if not block:
         return {"error": reason}
 
-    # The proposal id is assigned by the database inside
     rows = [r for r in db.get_proposals() if r["proposer"] == address]
     pid  = max((r["id"] for r in rows), default=None)
     return {
@@ -4457,7 +4556,6 @@ def vote(body: VoteBody):
     if not sig_ok:
         return {"error": f"Unauthorized: {sig_err}"}
 
-    # nonce + signature are spent inside net.send's transaction now
 
     block, reason = net.send(voter, voter, 0.0, body.pubkey, body.signature, body.timestamp, kind="VOTE", payload=payload, nonce=body.nonce)
     if not block:
@@ -4547,7 +4645,6 @@ def longevity():
         ],
     }
 
-# SLASH -- PENALTY
 
 def _apply_slash(address: str, amount: float, reason: str = ""):
     """Actually slashes the stake."""
@@ -4560,7 +4657,6 @@ def _apply_slash(address: str, amount: float, reason: str = ""):
     new_bio   = int(new_stake["bio_amount"]) if new_stake else 0
     new_tier = get_tier(new_bio)
     db.update_stake_tier(address, new_tier)
-    # preserves slash history instead of overwriting it
     db.log("SLASH", f"{address[:16]} -{sat_to_bio(amount)} BIO | reason: {reason} | via governance")
     print(f"[SLASH] {address[:16]}... -{sat_to_bio(amount)} BIO ({sat_to_bio(old_bio):.2f}->{sat_to_bio(new_bio):.2f}) | {reason}")
     return True, f"{address[:16]} -{sat_to_bio(amount)} BIO (tier: {new_tier})"
@@ -4640,7 +4736,6 @@ def _apply_server_reward(address: str, url: str = "", proposal_id: int = 0, amou
     return True, (f"{address[:16]} +{sat_to_bio(amount_sat)} BIO, url: {url} "
                   f"(server_rewards left: {sat_to_bio(net.emission.pools['server_rewards']):.2f})")
 
-# SUPPLY + VALIDATORS
 
 @app.get("/supply")
 def supply():
@@ -4663,7 +4758,6 @@ def supply():
         "genesis_remaining":em.GENESIS_MAX_COUNT - em.genesis_granted,
     }
 
-# NETWORK DASHBOARD ( patch -- transparency metrics)
 
 def _concentration(values: list) -> dict:
     """What share of the total is held by the top 1 / 5 / 10 addresses."""
@@ -4752,7 +4846,6 @@ def validators():
         "tiers":   STAKE_TIERS,
     }
 
-# SAVE / LOAD -- SNAPSHOTS
 
 @app.get("/checkpoints")
 def checkpoints():
@@ -4774,8 +4867,8 @@ def checkpoints():
         "checkpoint_every": CHECKPOINT_EVERY,
     }
 
-SNAPSHOT_COOLDOWN_SECONDS = 300   # /save -- at most once per 5 minutes
-SNAPSHOT_MAX_FILES        = 20    # oldest snapshots beyond this are pruned
+SNAPSHOT_COOLDOWN_SECONDS = 300
+SNAPSHOT_MAX_FILES        = 20
 _last_snapshot_time = 0.0
 
 @app.post("/save")
@@ -4802,7 +4895,6 @@ def save_snapshot():
         json.dump(snapshot, f, indent=2)
     db.log("SNAPSHOT_SAVED", fname)
 
-    # Prune beyond SNAPSHOT_MAX_FILES, oldest first -- caps disk usage
     existing = sorted(glob.glob("snapshot_*.json"))
     for old in existing[:-SNAPSHOT_MAX_FILES]:
         try:
@@ -4835,7 +4927,6 @@ def load_snapshot():
         "note":      "The database already holds full state -- snapshot is for auditing",
     }
 
-# WEBSOCKET
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
@@ -4850,12 +4941,11 @@ async def ws_endpoint(ws: WebSocket):
             if data.get("type") == "tx":
                 sender    = data.get("from","")
                 receiver  = data.get("to","")
-                value     = bio_to_sat(data.get("value", 0))   # boundary IN, sats
+                value     = bio_to_sat(data.get("value", 0))
                 ts        = float(data.get("timestamp", 0))
                 pubkey    = data.get("pubkey","")
                 signature = data.get("signature","")
                 nonce     = int(data.get("nonce", 0))
-                # same signed-message format as POST /tx
                 ws_msg = signed_message("TRANSFER", sender=sender, receiver=receiver,
                                         value=value, signed_ts=ts, nonce=nonce)
                 ok, err = verify_signed_request(sender, pubkey, signature, ws_msg, ts)
@@ -4902,7 +4992,6 @@ async def ws_endpoint(ws: WebSocket):
     except Exception:
         ws_clients.discard(ws)
 
-# STARTUP
 if __name__ == "__main__":
     print(f"""
 ╔══════════════════════════════════════════════════╗
