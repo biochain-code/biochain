@@ -4,7 +4,7 @@
 
 A post-quantum Layer-1 blockchain where nodes are not registered or deployed — they emerge organically from participant activity. An address that sends 21 impulses (transactions) automatically becomes a live network node; without continued activity its energy decays and it dies; new impulses revive it.
 
-> **Status: early, working, production-deployed on two independent nodes. Not yet publicly announced. Access to this repository is by direct invitation while the project completes decentralization and legal review — see [Access](#access) below.**
+> **Status: early, working, production-deployed on two independent nodes. Publicly available since July 2026 — see [Access](#access) below for what that does and doesn't mean yet.**
 
 ---
 
@@ -44,7 +44,7 @@ We document what actually broke and how it got fixed, not just what works when n
 | Max supply | 21,000,000 BIO, hard cap, immutable |
 | Governance | 1 live node = 1 vote, regardless of stake tier — capital affects rewards, never voting weight |
 
-Full technical detail is in `BioChain_Whitepaper_v5_40.docx` in this repository.
+Full technical detail is in `BioChain_Whitepaper_v5_43.docx` in this repository.
 
 ## Tokenomics — genesis distribution
 
