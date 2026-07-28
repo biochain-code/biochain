@@ -21,9 +21,20 @@ try:
 except ImportError:
     fastapi = _mk('fastapi')
     class FastAPI:
-        def __init__(self, **kw): pass
-        def get(self, *a, **k): return lambda f: f
-        def post(self, *a, **k): return lambda f: f
+        def __init__(self, **kw):
+            self.routes = {}  # (method, path) -> function -- lets tests
+            # verify a decorator actually landed on the function it was
+            # meant for, not just that "some" function got registered.
+        def get(self, path, *a, **k):
+            def _reg(f):
+                self.routes[("GET", path)] = f
+                return f
+            return _reg
+        def post(self, path, *a, **k):
+            def _reg(f):
+                self.routes[("POST", path)] = f
+                return f
+            return _reg
         def websocket(self, *a, **k): return lambda f: f
         def on_event(self, *a, **k): return lambda f: f
         def add_middleware(self, *a, **k): pass
@@ -59,7 +70,8 @@ except ImportError:
     ml.ML_DSA_44 = _ML(); stub.ml_dsa = ml
 
 # ── load the module fresh ────────────────────────────────────────────
-TEST_DIR = '/tmp/bc_test_v534'
+_BC_SRC_RESOLVED = os.path.abspath(os.environ.get('BC_SRC', '/home/deployer/biochain/biochain.py'))
+TEST_DIR = os.path.abspath(os.environ.get('BC_TEST_DIR', '/tmp/bc_test_v534'))
 os.makedirs(TEST_DIR, exist_ok=True)
 os.chdir(TEST_DIR)
 import shutil as _shutil
@@ -77,10 +89,15 @@ import importlib.util
 # for a regression run, which must stay fully offline and deterministic.
 os.environ["BIOCHAIN_PEER_URLS"] = "none"
 os.environ.pop("BIOCHAIN_SELF_URL", None)
-SRC = os.environ.get('BC_SRC', '/home/deployer/biochain/biochain.py')
+SRC = _BC_SRC_RESOLVED
 spec = importlib.util.spec_from_file_location("bc", SRC)
 bc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bc)
+
+bc.ENFORCE_SUPPLY_INVARIANT_PER_BLOCK = False  # test setup deliberately uses
+# db.credit() to fund scenarios directly, bypassing the pool-based genesis
+# flow -- a known, accepted test-scaffolding shortcut, not a real bug.
+# Production (biochain.py's own default) always enforces this per-block.
 
 S = bc.SAT_PER_BIO
 PASS = []; FAIL = []
@@ -90,6 +107,29 @@ def check(name, cond, detail=""):
     print(f"  [{mark}] {name}" + (f" -- {detail}" if detail and not cond else ""))
 
 print(f"=== BioChain v5.39 regression ({'REAL ML-DSA-44' if REAL_PQ else 'sandbox stubs'}) ===\n")
+
+# ── 0b. Crypto backend contract: liboqs primary, dilithium_py loud fallback only if liboqs is genuinely absent ──
+print("[0b] cryptographic backend: liboqs primary, dilithium_py fallback only if liboqs is genuinely absent")
+try:
+    import oqs as _oqs_probe   # noqa -- import used only to test its own availability here
+    _oqs_available = True
+except Exception:
+    # broad on purpose, matching biochain.py's own liboqs try/except --
+    # the oqs PACKAGE can import fine while its underlying .so genuinely
+    # isn't found (RuntimeError, not ImportError), depending on the oqs-
+    # python version and whether it eager- or lazy-loads the library.
+    _oqs_available = False
+
+if _oqs_available:
+    check("0b.1 liboqs IS installed in this environment -- backend MUST be liboqs, not a silent fallback",
+          getattr(bc, "_PQ_BACKEND", None) == "liboqs",
+          f"_PQ_BACKEND={getattr(bc, '_PQ_BACKEND', None)!r} but the oqs module IS importable here -- "
+          f"this means the liboqs integration is missing, broken, or silently failing its own startup "
+          f"self-test and falling back to ~228x slower dilithium_py without anyone noticing. This exact "
+          f"failure mode previously went undetected across several releases.")
+else:
+    print("    [SKIP] 0b.1 liboqs (the 'oqs' module) is not installed in this environment -- "
+          "dilithium_py fallback is the correct, expected behavior here, not a failure")
 
 # ── 1. Int foundation ────────────────────────────────────────────────
 print("[1] Integer foundation")
@@ -162,7 +202,7 @@ check("5.6 10000 x 1 сат == ровно 10000 сат (нет пыли)", db.ge
 # ── 6. Node birth + real block path (21 impulses) ────────────────────
 print("[6] Node birth & chain integrity (real net.send path)")
 pk, sk = bc.Dilithium.keygen()
-addr = "BIO1" + hashlib.sha3_256(pk).hexdigest()[:16].upper()
+addr = "BIO1" + hashlib.sha3_256(pk).hexdigest()[:32].upper()
 db.ensure_wallet(addr)
 # v5.40: Sybil-resistance requires MIN_EMERGENCE_SPAN_SECONDS (7 days)
 # between first_seen and the 21st impulse -- backdate first_seen here to
@@ -306,7 +346,7 @@ def _swap_send(kind, snd, sk_, pk_, rcv, val, payload, nn):
 
 # Вторая рука: свежий адрес с балансом
 pk2, sk2 = bc.Dilithium.keygen()
-addr2 = "BIO1" + hashlib.sha3_256(pk2).hexdigest()[:16].upper()
+addr2 = "BIO1" + hashlib.sha3_256(pk2).hexdigest()[:32].upper()
 bc.db.ensure_wallet(addr2); bc.db.credit(addr2, bc.bio_to_sat(50))
 
 # 14.1 OFFER публикуется
@@ -614,7 +654,7 @@ check("19.5 добавление staked_total чинит сумму, котор�
 print("[20] /register: грант первым 100 кошелькам")
 
 pk20, sk20 = bc.Dilithium.keygen()
-addr20 = "BIO1" + hashlib.sha3_256(pk20).hexdigest()[:16].upper()
+addr20 = "BIO1" + hashlib.sha3_256(pk20).hexdigest()[:32].upper()
 
 pool_before = bc.net.emission.pools.get("wallet_registration", 0)
 count_before = bc.db.registration_granted_count()
@@ -653,7 +693,7 @@ check("20.6 повторный REGISTER тем же адресом отклон�
 _orig_max = bc.WALLET_REGISTRATION_MAX_COUNT
 bc.WALLET_REGISTRATION_MAX_COUNT = count_after + 1   # ровно один слот остаётся
 pk20c, sk20c = bc.Dilithium.keygen()
-addr20c = "BIO1" + hashlib.sha3_256(pk20c).hexdigest()[:16].upper()
+addr20c = "BIO1" + hashlib.sha3_256(pk20c).hexdigest()[:32].upper()
 ts20c = time.time()
 msg20c = f"REGISTER|{addr20c}|{ts20c:.6f}|1"
 sig20c = bc.Dilithium.sign(sk20c, msg20c.encode())
@@ -662,7 +702,7 @@ resp20c = bc.register(body20c)
 check("20.7 REGISTER проходит на последнем оставшемся слоте", "error" not in resp20c, resp20c)
 
 pk20d, sk20d = bc.Dilithium.keygen()
-addr20d = "BIO1" + hashlib.sha3_256(pk20d).hexdigest()[:16].upper()
+addr20d = "BIO1" + hashlib.sha3_256(pk20d).hexdigest()[:32].upper()
 ts20d = time.time()
 msg20d = f"REGISTER|{addr20d}|{ts20d:.6f}|1"
 sig20d = bc.Dilithium.sign(sk20d, msg20d.encode())
@@ -812,7 +852,7 @@ bc.PEER_URLS.extend(_saved_peer_urls)
 print("[23] /verify: pending_unstakes -- пятое ведро инварианта (реальный баг)")
 
 pk23, sk23 = bc.Dilithium.keygen()
-addr23 = "BIO1" + hashlib.sha3_256(pk23).hexdigest()[:16].upper()
+addr23 = "BIO1" + hashlib.sha3_256(pk23).hexdigest()[:32].upper()
 
 # Тестовая подготовка баланса -- та же техника, что и общий addr/pk/sk
 # наверху файла (db.credit напрямую, в обход подписанного перевода,
@@ -1009,7 +1049,7 @@ check("26.9 отданный кандидат честно показывает 
 print("[27] Sybil-resistance: MIN_EMERGENCE_SPAN_SECONDS -- реальная защита")
 
 pk27, sk27 = bc.Dilithium.keygen()
-addr27 = "BIO1" + hashlib.sha3_256(pk27).hexdigest()[:16].upper()
+addr27 = "BIO1" + hashlib.sha3_256(pk27).hexdigest()[:32].upper()
 db.ensure_wallet(addr27)   # first_seen == СЕЙЧАС, свежий адрес -- НЕ состарен
 db.credit(addr27, bc.bio_to_sat(500))
 
@@ -1137,7 +1177,7 @@ check("30.1 пул developer_grants выделен и == 254,500 BIO (v5.41: п�
       bc.sat_to_bio(bc.net.emission.pools["developer_grants"]))
 
 pk30, sk30 = bc.Dilithium.keygen()
-addr30 = "BIO1" + hashlib.sha3_256(pk30).hexdigest()[:16].upper()
+addr30 = "BIO1" + hashlib.sha3_256(pk30).hexdigest()[:32].upper()
 pool_before30 = bc.net.emission.pools["developer_grants"]
 
 ok30, msg30 = bc._apply_developer_grant(addr30, "TestWallet", "A test wallet app", 1, bc.bio_to_sat(2000))
@@ -1169,17 +1209,18 @@ pk31, sk31 = bc.Dilithium.keygen()
 
 # 31.1 -- pq.address() БЕЗ явного scheme_id (старый способ вызова, как
 # делает весь остальной код сегодня) даёт ТОЧНО тот же результат, что
-# и старая, оригинальная формула -- побайтово.
+# и текущая формула -- побайтово, независимо переисчисленная здесь же,
+# не просто повторным вызовом того же кода.
 addr_default = bc.pq.address(pk31)
 addr_explicit_mldsa = bc.pq.address(pk31, scheme_id="MLDSA44")
-addr_manual_original_formula = "BIO1" + __import__("hashlib").sha3_256(pk31).hexdigest()[:16].upper()
+addr_manual_current_formula = "BIO1" + __import__("hashlib").sha3_256(pk31).hexdigest()[:32].upper()
 
 check("31.1 pq.address() без scheme_id == адрес с явным MLDSA44",
       addr_default == addr_explicit_mldsa)
-check("31.2 адрес совпадает с оригинальной, дословной формулой BioChain "
-      "(обратная совместимость доказана, не предположена)",
-      addr_default == addr_manual_original_formula,
-      f"{addr_default} vs {addr_manual_original_formula}")
+check("31.2 адрес совпадает с текущей, дословной формулой BioChain "
+      "(32 символа/128 бит, обновлено 2026-07-27 -- независимая проверка, не предположена)",
+      addr_default == addr_manual_current_formula,
+      f"{addr_default} vs {addr_manual_current_formula}")
 
 # 31.3 -- гипотетическая ДРУГАЯ схема с ТЕМИ ЖЕ сырыми байтами ключа
 # даёт ДРУГОЙ адрес -- никогда не коллизирует с существующими MLDSA44
@@ -1204,7 +1245,7 @@ check("31.5 verify() с несуществующей схемой -- честн�
 
 # 31.6 -- новая колонка sig_scheme существует и по умолчанию MLDSA44
 # для реального кошелька, созданного обычным путём
-addr31_wallet = "BIO1" + __import__("hashlib").sha3_256(pk31).hexdigest()[:16].upper()
+addr31_wallet = "BIO1" + __import__("hashlib").sha3_256(pk31).hexdigest()[:32].upper()
 bc.db.ensure_wallet(addr31_wallet)
 row31 = bc.db.conn.execute(
     "SELECT sig_scheme FROM wallets WHERE address=?", (addr31_wallet,)).fetchone()
@@ -1247,7 +1288,7 @@ check("32.2 developer_grants(текущий) + уже выданные гран�
 # и Network.send (validate), и apply_peer_block (peer validate) должны
 # отвергать его с честным сообщением, а не молча проходить.
 pk32, sk32 = bc.Dilithium.keygen()
-addr32 = "BIO1" + hashlib.sha3_256(pk32).hexdigest()[:16].upper()
+addr32 = "BIO1" + hashlib.sha3_256(pk32).hexdigest()[:32].upper()
 bc.db.ensure_wallet(addr32)
 sig32_dead = bc.Dilithium.sign(sk32, b"whatever")
 blk32_dead, err32_dead = bc.net.send(addr32, addr32, 0, pk32.hex(), sig32_dead.hex(), time.time(),
@@ -1260,10 +1301,16 @@ resp32_old_endpoint = bc.claim_server_reward(bc.ClaimServerRewardBody(address=ad
 check("32.4 /claim_server_reward endpoint отвечает 'removed', не эндпоинтом выплаты",
       "error" in resp32_old_endpoint and "no longer supported" in resp32_old_endpoint["error"], resp32_old_endpoint)
 
-# 32.5 -- /peer/announce больше не принимает и не хранит claim-привязку
-# (AnnounceBody больше не имеет claimant_address/pubkey/signature полей)
-check("32.5 AnnounceBody больше не содержит claim-полей",
-      not hasattr(bc.AnnounceBody(url="https://x.example"), "claimant_address"))
+# 32.5 -- /peer/announce не хранит claim-привязку (AnnounceBody has no
+# claimant_address field from the old, removed claim feature -- note
+# this is DIFFERENT from the address/pubkey/signature/timestamp/nonce
+# fields added later the same day for Sybil-resistant announce-signing;
+# those are a real, current, unrelated part of the schema, so a valid
+# construction needs dummy values for them to pass pydantic validation).
+check("32.5 AnnounceBody больше не содержит claim-полей от старой фичи",
+      not hasattr(bc.AnnounceBody(url="https://x.example", address="BIO1DUMMY",
+                                    pubkey="00", signature="00", timestamp=0.0, nonce=0),
+                  "claimant_address"))
 
 # 32.6 -- ПРАВИЛЬНЫЙ путь: server_reward через governance (тот же
 # механизм, что developer_grant) -- полностью chain-derived, без
@@ -1388,9 +1435,34 @@ bc.PEER_URLS.remove(url33_unreachable)   # cleanup -- keep later sections' PEER_
 # instance_id is rejected outright as a self-announcement, not merely
 # recorded as a harmless candidate.
 bc.http_requests.get = _get_self_echo
-resp33_announce = bc.peer_announce(bc.AnnounceBody(url="https://yet-another-alias.example/api"))
+pk33a, sk33a = bc.Dilithium.keygen()
+addr33a = "BIO1" + hashlib.sha3_256(pk33a).hexdigest()[:32].upper()
+url33a = "https://yet-another-alias.example/api"
+ts33a = time.time()
+msg33a = f"ANNOUNCE|{addr33a}|{url33a}|{ts33a:.6f}|1"
+sig33a = bc.Dilithium.sign(sk33a, msg33a.encode())
+resp33_announce = bc.peer_announce(bc.AnnounceBody(
+    url=url33a, address=addr33a, pubkey=pk33a.hex(), signature=sig33a.hex(),
+    timestamp=ts33a, nonce=1))
 check("33.7 /peer/announce отклоняет самообъявление по instance_id",
       "error" in resp33_announce and "own URL to itself" in resp33_announce["error"], resp33_announce)
+
+# 33.7b -- Sybil protection: a claimed address that doesn't match the
+# given pubkey must be rejected outright (pq.address(pubkey) != address
+# is a real, mock-independent check, unlike raw signature bytes in the
+# test harness's simplified crypto stub).
+pk33b, sk33b = bc.Dilithium.keygen()
+pk33b_other, _ = bc.Dilithium.keygen()  # a DIFFERENT keypair entirely
+addr33b_wrong = "BIO1" + hashlib.sha3_256(pk33b_other).hexdigest()[:32].upper()
+url33b = "https://sybil-attempt.example/api"
+ts33b = time.time()
+msg33b = f"ANNOUNCE|{addr33b_wrong}|{url33b}|{ts33b:.6f}|1"
+sig33b = bc.Dilithium.sign(sk33b, msg33b.encode())
+resp33b = bc.peer_announce(bc.AnnounceBody(
+    url=url33b, address=addr33b_wrong, pubkey=pk33b.hex(), signature=sig33b.hex(),
+    timestamp=ts33b, nonce=1))
+check("33.7b /peer/announce отклоняет announce, где адрес не соответствует ключу (Sybil-защита)",
+      "error" in resp33b and "does not match" in resp33b["error"], resp33b)
 
 # 33.8 -- fast_sync_from_snapshot(): a bootstrap peer that turns out to
 # be ourselves is recognized and skipped before any checkpoint fetch.
@@ -1422,3 +1494,533 @@ if FAIL:
     print("Провалены:"); [print("  -", f) for f in FAIL]
     sys.exit(1)
 print("ВСЯ INT-РЕГРЕССИЯ ЧИСТАЯ.")
+
+# ============================================================
+# 34 -- regression tests for everything found and fixed during
+# the two Kimi-review passes on 2026-07-26. Each check here exists
+# specifically because the bug it guards against was real, found by
+# reading the code (not assumed), and fixed the same day -- these
+# checks are what stop it from silently coming back.
+# ============================================================
+print("\n[34] Kimi-review regression fixes (2026-07-26)")
+
+# 34.1 -- BC-002: role assignment must be a pure, deterministic function
+# of (address, births) -- the original bug was random.choice(), which
+# let different peers assign different roles to the same newly-born node.
+_role_a = bc.ROLES[int(hashlib.sha256("BIO_DET_TEST_1".encode() + b"1").hexdigest(), 16) % len(bc.ROLES)]
+_role_b = bc.ROLES[int(hashlib.sha256("BIO_DET_TEST_1".encode() + b"1").hexdigest(), 16) % len(bc.ROLES)]
+_n34_1 = bc.Node("BIO_DET_TEST_1", 1)
+check("34.1 роль ноды детерминирована по (address, births), не random.choice",
+      _n34_1.role == _role_a == _role_b)
+
+# 34.2 -- bio_to_sat must reject non-finite input cleanly (inf/nan) rather
+# than raise an unhandled ValueError deep inside string-splitting.
+_bio_to_sat_inf_raised = False
+try:
+    bc.bio_to_sat(float("inf"))
+except ValueError:
+    _bio_to_sat_inf_raised = True
+except Exception:
+    pass
+check("34.2 bio_to_sat отклоняет inf через чистый ValueError", _bio_to_sat_inf_raised)
+
+_bio_to_sat_nan_raised = False
+try:
+    bc.bio_to_sat(float("nan"))
+except ValueError:
+    _bio_to_sat_nan_raised = True
+except Exception:
+    pass
+check("34.2b bio_to_sat отклоняет nan через чистый ValueError", _bio_to_sat_nan_raised)
+
+# 34.3 -- RateLimiter.cleanup() must actually remove keys with no recent
+# activity -- the original bug let _counts grow forever, one entry per
+# unique address/IP ever seen, even long after their window expired.
+_rl34 = bc.RateLimiter()
+_rl34.check("stale-key-34", limit=1000, window=60)
+_rl34._counts["stale-key-34"] = [0.0]   # a timestamp far in the past
+_rl34.cleanup(window=60)
+check("34.3 RateLimiter.cleanup() удаляет устаревшие ключи",
+      "stale-key-34" not in _rl34._counts)
+
+# 34.4 -- the generic per-field rollback: a mid-transaction failure must
+# restore EVERY Node field it touched (not just balance, which was the
+# only field the old mechanism protected).
+_n34_4 = bc.Node("BIO_ROLLBACK_TEST_34", 1)
+bc.net.nodes["BIO_ROLLBACK_TEST_34"] = _n34_4
+bc.net._rebuild_death_schedule()
+_energy_before_34  = _n34_4.energy
+_alive_before_34   = _n34_4.alive
+_sum_before_34     = bc.net._alive_energy_sum
+bc.net._begin_balance_recording()
+_n34_4.energy = 123_456_789
+_n34_4.alive  = False
+_record_34, _newaddr_34 = bc.net._end_balance_recording()
+_snap_34 = {"chain_len": len(bc.net.chain), "em_pools": dict(bc.net.emission.pools),
+            "em_minted": bc.net.emission.minted, "em_burned": bc.net.emission.burned,
+            "em_halvings": bc.net.emission.halvings, "em_start_time": bc.net.emission.start_time,
+            "eco_state": dict(bc.net.eco.__dict__), "gov_state": bc._snapshot_governance_state()}
+bc.net._restore_inmem(_snap_34, (_record_34, _newaddr_34))
+check("34.4 откат восстанавливает energy ноды (не только balance)",
+      _n34_4.energy == _energy_before_34)
+check("34.4b откат восстанавливает alive ноды",
+      _n34_4.alive == _alive_before_34)
+check("34.4c откат пересобирает _alive_energy_sum корректно",
+      bc.net._alive_energy_sum == _sum_before_34)
+del bc.net.nodes["BIO_ROLLBACK_TEST_34"]
+bc.net._rebuild_death_schedule()
+
+# 34.5 -- a node that EMERGED mid-transaction must be fully removed on
+# rollback, not left present with reset-to-default fields.
+_addrs_before_34_5 = set(bc.net.nodes.keys())
+bc.net._begin_balance_recording()
+bc.net._emerge("BIO_EMERGE_ROLLBACK_34", now=time.time(), births=1)
+_emerged_34 = "BIO_EMERGE_ROLLBACK_34" in bc.net.nodes
+_record_34_5, _newaddr_34_5 = bc.net._end_balance_recording()
+_snap_34_5 = {"chain_len": len(bc.net.chain), "em_pools": dict(bc.net.emission.pools),
+              "em_minted": bc.net.emission.minted, "em_burned": bc.net.emission.burned,
+              "em_halvings": bc.net.emission.halvings, "em_start_time": bc.net.emission.start_time,
+              "eco_state": dict(bc.net.eco.__dict__), "gov_state": bc._snapshot_governance_state()}
+bc.net._restore_inmem(_snap_34_5, (_record_34_5, _newaddr_34_5))
+check("34.5 нода реально появилась перед откатом (иначе тест ничего не проверяет)",
+      _emerged_34)
+check("34.5b откат полностью убирает возникшую в транзакции ноду",
+      "BIO_EMERGE_ROLLBACK_34" not in bc.net.nodes)
+check("34.5c откат не оставляет посторонних адресов",
+      set(bc.net.nodes.keys()) == _addrs_before_34_5)
+
+# 34.6 -- /peer/chain and /chain pagination: limit must be respected.
+_page34 = bc.net.chain_view(from_block=0, limit=1)
+check("34.6 chain_view(limit=1) возвращает не больше 1 блока",
+      len(_page34) <= 1)
+if len(bc.net.chain) > 1:
+    check("34.6b chain_view(limit=1) реально урезает при непустой цепи длиннее 1",
+          len(_page34) == 1)
+
+# 34.7 -- rate limiters exist and are wired to the endpoints that were
+# previously completely unprotected (/peer/chain, /chain, /peer/announce).
+check("34.7 peer_chain_rate_limiter существует и является RateLimiter",
+      isinstance(bc.peer_chain_rate_limiter, bc.RateLimiter))
+check("34.7b PEER_CHAIN_MAX_LIMIT определена до первого использования (никаких NameError при импорте)",
+      isinstance(bc.PEER_CHAIN_MAX_LIMIT, int) and bc.PEER_CHAIN_MAX_LIMIT > 0)
+
+# 34.8 -- swap methods must defer to the shared transaction's own commit
+# via _commit(), not call self.conn.commit() directly -- otherwise a
+# later failure in the same db.transaction() can't roll them back.
+import inspect as _inspect34
+for _m34 in ("create_swap_lock", "settle_swap_lock", "create_swap_offer", "cancel_swap_offer"):
+    _src34 = _inspect34.getsource(getattr(bc.Database, _m34))
+    check(f"34.8 {_m34} использует self._commit(), не self.conn.commit() напрямую",
+          "self.conn.commit()" not in _src34 and "self._commit()" in _src34)
+
+# 34.9 -- prune_stale_candidates must actually persist its deletes.
+_src34_9 = _inspect34.getsource(bc.Database.prune_stale_candidates)
+check("34.9 prune_stale_candidates вызывает self._commit()",
+      "self._commit()" in _src34_9)
+
+print(f"\n=== ИТОГ (включая раздел 34): {len(PASS)} PASS / {len(FAIL)} FAIL ===")
+if FAIL:
+    print("Провалены:"); [print("  -", f) for f in FAIL]
+    sys.exit(1)
+print("ВСЯ INT-РЕГРЕССИЯ ЧИСТАЯ, ВКЛЮЧАЯ РЕГРЕССЫ 2026-07-26.")
+
+# ============================================================
+# 35 -- stress tests promoted from one-off verification scripts into
+# the permanent suite: real multithreading (not sequential calls),
+# fork-resolution staleness, JSON-canonicalization immunity, and
+# X-Forwarded-For handling -- none of which section 34 exercises.
+# ============================================================
+print("\n[35] Promoted stress tests (real threading, fork staleness, JSON, XFF)")
+
+import threading as _threading35
+
+# 35.1-35.4 -- REAL multithreading: two actual OS threads, not two
+# sequential calls on the same thread -- the only way to genuinely
+# exercise threading.local() isolation between concurrent transactions
+# (e.g. the main request thread vs. a fork-resolution replay thread).
+_node_main_35 = bc.Node("BIO_THREAD_MAIN_35", 1)
+_node_bg_35   = bc.Node("BIO_THREAD_BG_35", 1)
+bc.net.nodes["BIO_THREAD_MAIN_35"] = _node_main_35
+bc.net.nodes["BIO_THREAD_BG_35"]   = _node_bg_35
+_results_35 = {}
+_barrier_35 = _threading35.Barrier(2)
+
+def _main_thread_work_35():
+    bc.net._begin_balance_recording()
+    _barrier_35.wait()
+    for _ in range(2000):
+        _node_main_35.energy = _node_main_35.energy + 1
+    time.sleep(0.05)
+    record, _ = bc.net._end_balance_recording()
+    _results_35["main_len"] = len(record)
+    _results_35["main_touched"] = {(n.address, f) for n, f, _ in record}
+
+def _bg_thread_work_35():
+    bc.net._begin_balance_recording()
+    _barrier_35.wait()
+    for _ in range(2000):
+        _node_bg_35.reputation = _node_bg_35.reputation + 1
+    time.sleep(0.05)
+    record, _ = bc.net._end_balance_recording()
+    _results_35["bg_len"] = len(record)
+    _results_35["bg_touched"] = {(n.address, f) for n, f, _ in record}
+
+_t1_35 = _threading35.Thread(target=_main_thread_work_35)
+_t2_35 = _threading35.Thread(target=_bg_thread_work_35)
+_t1_35.start(); _t2_35.start()
+_t1_35.join(); _t2_35.join()
+
+check("35.1 поток A записал ровно 1 изменение поля (реальный OS-поток, не последовательный вызов)",
+      _results_35.get("main_len") == 1, _results_35.get("main_len"))
+check("35.2 поток B записал ровно 1 изменение поля",
+      _results_35.get("bg_len") == 1, _results_35.get("bg_len"))
+check("35.3 поток A не видел поле потока B -- реальная изоляция threading.local между конкурентными нитями",
+      ("BIO_THREAD_BG_35", "reputation") not in _results_35.get("main_touched", set()))
+check("35.4 поток B не видел поле потока A",
+      ("BIO_THREAD_MAIN_35", "energy") not in _results_35.get("bg_touched", set()))
+
+del bc.net.nodes["BIO_THREAD_MAIN_35"]
+del bc.net.nodes["BIO_THREAD_BG_35"]
+bc.net._rebuild_death_schedule()
+
+# 35.5 -- resolve_fork must discard a replayed candidate if the live
+# chain advanced past chain_len_before during the (now unlocked) replay
+# window -- the race this exact staleness check protects against.
+_chain_len_before_35 = len(bc.net.chain)
+_orig_replay_35 = bc._replay_candidate_chain
+def _fake_replay_grows_chain_35(candidate):
+    bc.net.chain.append(bc.net.chain[-1] if bc.net.chain else None)
+    return True, "ok", "/tmp/does_not_matter_35.db"
+bc._replay_candidate_chain = _fake_replay_grows_chain_35
+_ok_35, _reason_35 = bc.net.resolve_fork([{"hash": "f" * 64, "prev_hash": "0" * 64}] * (_chain_len_before_35 + 5))
+check("35.5 resolve_fork отбрасывает кандидата, если цепь выросла во время replay",
+      _ok_35 is False and "advanced during replay" in _reason_35, _reason_35)
+if _chain_len_before_35 < len(bc.net.chain):
+    del bc.net.chain[_chain_len_before_35:]
+bc._replay_candidate_chain = _orig_replay_35
+
+# 35.6-35.7 -- signed_message() extracts named fields from the parsed
+# payload in a fixed order -- key order and whitespace in the ORIGINAL
+# JSON string must never affect the signed bytes.
+_payload_a_35 = json.dumps({"title": "Test", "param_key": "emerge_threshold", "param_value": "25"})
+_payload_b_35 = json.dumps({"param_value": "25", "title": "Test", "param_key": "emerge_threshold"},
+                            separators=(", ", ": "))
+_payload_c_35 = '{"param_key":  "emerge_threshold" , "title":"Test",   "param_value":"25"}'
+_msg_a_35 = bc.signed_message("PROPOSAL", sender="BIO1TEST35", signed_ts=1000.0, nonce=1, payload=_payload_a_35)
+_msg_b_35 = bc.signed_message("PROPOSAL", sender="BIO1TEST35", signed_ts=1000.0, nonce=1, payload=_payload_b_35)
+_msg_c_35 = bc.signed_message("PROPOSAL", sender="BIO1TEST35", signed_ts=1000.0, nonce=1, payload=_payload_c_35)
+check("35.6 разный порядок ключей JSON даёт идентичную подписываемую строку",
+      _msg_a_35 == _msg_b_35, f"{_msg_a_35!r} vs {_msg_b_35!r}")
+check("35.7 разные пробелы/форматирование JSON тоже не влияют на подпись",
+      _msg_a_35 == _msg_c_35, f"{_msg_a_35!r} vs {_msg_c_35!r}")
+
+# 35.8-35.10 -- _client_ip(): the LAST entry in X-Forwarded-For is what
+# our own reverse proxy actually observed; earlier entries are
+# client-supplied and must never be trusted for rate limiting.
+class _FakeHeaders35:
+    def __init__(self, d): self._d = d
+    def get(self, k): return self._d.get(k)
+class _FakeClient35:
+    def __init__(self, host): self.host = host
+class _FakeRequest35:
+    def __init__(self, headers, client_host):
+        self.headers = _FakeHeaders35(headers)
+        self.client  = _FakeClient35(client_host)
+
+_req_xff_35 = _FakeRequest35({"x-forwarded-for": "1.2.3.4, 5.6.7.8, 9.9.9.9"}, "10.0.0.1")
+check("35.8 _client_ip берёт ПОСЛЕДНИЙ элемент X-Forwarded-For, не первый (клиент может подделать первые)",
+      bc._client_ip(_req_xff_35) == "9.9.9.9", bc._client_ip(_req_xff_35))
+check("35.9 без X-Forwarded-For использует request.client.host",
+      bc._client_ip(_FakeRequest35({}, "10.0.0.1")) == "10.0.0.1")
+check("35.10 без объекта request вообще -- 'unknown', не падает",
+      bc._client_ip(None) == "unknown")
+
+print(f"\n=== ИТОГ (включая разделы 34-35): {len(PASS)} PASS / {len(FAIL)} FAIL ===")
+if FAIL:
+    print("Провалены:"); [print("  -", f) for f in FAIL]
+    sys.exit(1)
+print("ВСЯ INT-РЕГРЕССИЯ ЧИСТАЯ, ВКЛЮЧАЯ РЕАЛЬНУЮ МНОГОПОТОЧНОСТЬ И FORK-ГОНКИ.")
+
+# ============================================================
+# 36 -- regression tests for the CRIT/HIGH/MED/LOW findings from the
+# two-round Kimi review on biochain_v543_FINAL5/6.py (2026-07-26,
+# later session). Each guards a real, confirmed-by-reading-the-code bug
+# that was fixed the same day.
+# ============================================================
+print("\n[36] Second Kimi-review round -- CRIT/HIGH regression fixes")
+
+# 36.1-36.2 -- CRIT-2: mint_reward() and _expected_reward() must never
+# be able to drift apart again, because they now call the exact same
+# Emission.calc_reward(). Test both the odd-base/1.5x-multiplier case
+# AND the taper case (pool below VALIDATORS_TAPER_FLOOR) that the
+# original audit missed entirely.
+_addr36 = "BIO_TEST_36_CRIT2"
+bc.db.ensure_wallet(_addr36)
+_node36 = bc.Node(_addr36, 1)
+bc.net.nodes[_addr36] = _node36
+bc.db.save_stake(_addr36, 5_000 * bc.SAT_PER_BIO, "SENIOR_VALIDATOR")
+
+_saved_pool_36 = bc.net.emission.pools["validators"]
+bc.net.emission.pools["validators"] = 500_000 * bc.SAT_PER_BIO
+_predicted_36 = bc.net._expected_reward(_addr36, bc.net.chain_time() or 1000.0)
+_minted_36    = bc.net.emission.mint_reward(_node36, len(bc.net.chain), bc.net.chain_time() or 1000.0)
+check("36.1 mint_reward() и _expected_reward() совпадают при истощённом (taper) пуле",
+      _predicted_36 == _minted_36, f"{_predicted_36} vs {_minted_36}")
+bc.net.emission.pools["validators"] = _saved_pool_36
+del bc.net.nodes[_addr36]
+bc.net._rebuild_death_schedule()
+
+check("36.2 Network._expected_reward и Emission.mint_reward используют один calc_reward",
+      "self.emission.calc_reward" in __import__("inspect").getsource(bc.Network._expected_reward))
+
+# 36.3 -- CRIT-3: the death-schedule heap must self-rebuild once it
+# accumulates far more stale entries than there are actual alive nodes.
+_node36c = bc.Node("BIO_TEST_36_CRIT3", 1)
+_node36c.alive = True
+bc.net.nodes["BIO_TEST_36_CRIT3"] = _node36c
+bc.net._rebuild_death_schedule()
+for _i in range(500):
+    bc.net._death_schedule.append((10**9 + _i, "BIO_TEST_36_CRIT3"))
+import heapq as _heapq36
+_heapq36.heapify(bc.net._death_schedule)
+_size_before_36c = len(bc.net._death_schedule)
+bc.net._process_deaths(now_block=1, now_time=time.time())
+check("36.3 переполненная куча _death_schedule пересобирается автоматически",
+      len(bc.net._death_schedule) < _size_before_36c, f"{_size_before_36c} -> {len(bc.net._death_schedule)}")
+del bc.net.nodes["BIO_TEST_36_CRIT3"]
+bc.net._rebuild_death_schedule()
+
+# 36.4 -- CRIT-4: _alive_energy_sum must stay exactly in sync with a
+# node's real energy even when decay happens via _can_finalize()'s
+# materialize() call -- the path the original code never accounted for.
+_node36d = bc.Node("BIO_TEST_36_CRIT4", 1)
+_node36d.energy = 20 * bc.CONSENSUS_SCALE
+_node36d.state_block = -100
+_node36d.alive = True
+bc.net.nodes["BIO_TEST_36_CRIT4"] = _node36d
+_sum_before_36d = bc.net._alive_energy_sum
+_energy_before_36d = _node36d.energy
+class _FakeImpulse36:
+    energy = 1.0
+bc.net._can_finalize(_node36d, _FakeImpulse36())
+_actual_decay_36d   = _energy_before_36d - _node36d.energy
+_actual_sum_delta_36d = _sum_before_36d - bc.net._alive_energy_sum
+check("36.4 _alive_energy_sum уменьшается ровно на величину decay после _can_finalize",
+      _actual_sum_delta_36d == _actual_decay_36d,
+      f"decay={_actual_decay_36d}, sum_delta={_actual_sum_delta_36d}")
+del bc.net.nodes["BIO_TEST_36_CRIT4"]
+bc.net._rebuild_death_schedule()
+
+# 36.5 -- HIGH-2: RateLimiter must enforce a hard cap on total distinct
+# keys, independent of periodic cleanup() -- protects against a burst
+# of unique addresses/IPs within a single cleanup window.
+_rl36 = bc.RateLimiter()
+_orig_cap_36 = bc.RATE_LIMITER_MAX_KEYS
+bc.RATE_LIMITER_MAX_KEYS = 10
+_rl36._counts = __import__("collections").OrderedDict()
+for _i in range(200):
+    _rl36.check(f"flood-key-{_i}")
+check("36.5 RateLimiter не превышает жёсткий потолок ключей даже при потоке уникальных значений",
+      len(_rl36._counts) <= 10, len(_rl36._counts))
+bc.RATE_LIMITER_MAX_KEYS = _orig_cap_36
+
+# 36.6 -- HIGH-3: _adopt_replayed_chain must swap `db` only inside
+# _db_swap_lock, so a background thread can never observe a closed or
+# half-replaced connection.
+_src36_6 = __import__("inspect").getsource(bc.Network._adopt_replayed_chain)
+check("36.6 _adopt_replayed_chain использует _db_swap_lock вокруг подмены db",
+      "_db_swap_lock" in _src36_6)
+
+# 36.7-36.10 -- HIGH-4: SSRF protection on peer URLs (both direct
+# /peer/announce and the gossip -> try_promote_candidate path).
+check("36.7 _is_safe_peer_url блокирует loopback",
+      bc._is_safe_peer_url("http://127.0.0.1:8000/api") is False)
+check("36.8 _is_safe_peer_url блокирует cloud-metadata (169.254.169.254)",
+      bc._is_safe_peer_url("http://169.254.169.254/latest/meta-data/") is False)
+check("36.9 _is_safe_peer_url блокирует RFC1918 (10.x/172.16.x/192.168.x)",
+      bc._is_safe_peer_url("http://10.0.0.5/api") is False and
+      bc._is_safe_peer_url("http://192.168.1.1/api") is False)
+check("36.10 _is_safe_peer_url пропускает нерезолвящийся домен (fail-open, не риск SSRF)",
+      bc._is_safe_peer_url("http://this-will-never-resolve-xyz123.invalid/api") is True)
+_src36_11 = __import__("inspect").getsource(bc.try_promote_candidate)
+check("36.11 try_promote_candidate проверяет безопасность URL (путь через gossip)",
+      "_resolve_safe_peer_ip" in _src36_11)
+
+# 36.12 -- HIGH-5: snapshot file writes must be atomic (temp file + rename),
+# never a direct write that could leave a truncated file on crash.
+_src36_12 = __import__("inspect").getsource(bc.write_snapshot_file)
+check("36.12 write_snapshot_file пишет во временный файл и переименовывает (os.replace)",
+      "os.replace" in _src36_12 and ".tmp" in _src36_12)
+
+# 36.13 -- MED-2: dead check_alive() must actually be gone, not just
+# unused -- confirms the cleanup landed, not just that it was proposed.
+check("36.13 мёртвый метод Node.check_alive удалён",
+      not hasattr(bc.Node, "check_alive"))
+
+print(f"\n=== ИТОГ (включая разделы 34-36): {len(PASS)} PASS / {len(FAIL)} FAIL ===")
+if FAIL:
+    print("Провалены:"); [print("  -", f) for f in FAIL]
+    sys.exit(1)
+print("ВСЯ INT-РЕГРЕССИЯ ЧИСТАЯ, ВКЛЮЧАЯ ОБА РАУНДА KIMI-РЕВЬЮ.")
+
+# ============================================================
+# 37 -- five fixes from later rounds that only had ad-hoc manual
+# verification before now, no permanent regression coverage: DNS-rebinding
+# IP-pinning, fork-resolution cooldown, pubkey length, peer-block
+# finalization-threshold re-check, and the per-block supply invariant.
+# ============================================================
+print("\n[37] Regression coverage for previously ad-hoc-only fixes")
+
+# 37.1-37.2 -- DNS-rebinding: try_promote_candidate must connect to the
+# IP it already verified, not re-resolve the hostname a second time.
+bc.socket.gethostbyname = lambda host: "8.8.8.8"
+_captured37 = {}
+def _fake_get37(url, headers=None, timeout=None):
+    _captured37["url"] = url; _captured37["headers"] = headers
+    class _R:
+        def json(self): return {"instance_id": "not-us"}
+    return _R()
+_orig_get37 = bc.http_requests.get
+bc.http_requests.get = _fake_get37
+bc.HTTP_OK = True
+bc.db.save_promoted_peer = lambda *a, **k: True
+bc.try_promote_candidate("http://rebinding-test-37.example/api", confirmations=999)
+check("37.1 try_promote_candidate коннектится к уже проверенному IP, не к hostname заново",
+      _captured37.get("url", "").startswith("http://8.8.8.8"), _captured37.get("url"))
+check("37.2 Host-заголовок сохраняет исходное имя для маршрутизации на стороне пира",
+      _captured37.get("headers", {}).get("Host") == "rebinding-test-37.example")
+bc.http_requests.get = _orig_get37
+
+# 37.3-37.4 -- fork-resolution cooldown: same peer blocked immediately
+# after one attempt, a different peer is independently allowed.
+check("37.3 _fork_resolution_allowed разрешает первую попытку",
+      bc._fork_resolution_allowed("http://cooldown-test-37a.example"))
+check("37.4 _fork_resolution_allowed немедленно блокирует повтор для того же пира",
+      not bc._fork_resolution_allowed("http://cooldown-test-37a.example"))
+
+# 37.5-37.6 -- pubkey length: exactly 1312 bytes required for ML-DSA-44,
+# both a too-short and a too-long key must be rejected before any
+# cryptographic verify() call even happens.
+ok37a, err37a = bc.verify_signed_request("BIO1X", "aa"*100, "00"*76, "msg", time.time())
+check("37.5 verify_signed_request отклоняет слишком короткий pubkey",
+      not ok37a and "1312" in err37a, err37a)
+ok37b, err37b = bc.verify_signed_request("BIO1X", "aa"*2000, "00"*76, "msg", time.time())
+check("37.6 verify_signed_request отклоняет слишком длинный pubkey",
+      not ok37b and "1312" in err37b, err37b)
+
+# 37.7 -- peer-block finalization threshold: a validator that was
+# legitimately SELECTED but does not meet the weight/stability bar
+# (_can_finalize) must still be rejected, not just checked for selection
+# legitimacy alone.
+_src37_7 = __import__("inspect").getsource(bc.Network._apply_peer_block_locked)
+check("37.7 _apply_peer_block_locked перепроверяет _can_finalize для валидатора из блока пира",
+      "_can_finalize(validator_node" in _src37_7)
+
+# 37.8-37.9 -- per-block supply invariant: production enforces it (default
+# True, verified directly against the source file since the test harness
+# itself disables it on its own loaded copy), and a genuine violation is
+# actually caught and raises, not just logged and ignored.
+check("37.8 ENFORCE_SUPPLY_INVARIANT_PER_BLOCK по умолчанию True в самом исходном файле",
+      "ENFORCE_SUPPLY_INVARIANT_PER_BLOCK = True" in open(SRC, encoding="utf-8").read())
+
+bc.db.ensure_wallet("BIO_TEST_37_INVARIANT")
+bc.db.credit("BIO_TEST_37_INVARIANT", 777_00000000)  # inject money from nowhere
+_grand37, _expected37 = bc._check_supply_invariant(bc.net)
+check("37.9a _check_supply_invariant корректно обнаруживает искусственно нарушенный баланс",
+      _grand37 != _expected37, f"{_grand37} vs {_expected37}")
+_saved_flag37 = bc.ENFORCE_SUPPLY_INVARIANT_PER_BLOCK
+bc.ENFORCE_SUPPLY_INVARIANT_PER_BLOCK = True
+try:
+    bc.net._after_block(type("FakeBlock37", (), {"t": time.time()})(),
+                         "BIO_TEST_37_INVARIANT", "BIO_TEST_37_INVARIANT", 0)
+    check("37.9b _after_block поднимает исключение при нарушенном инварианте (продакшен-режим)",
+          False, "исключение не было поднято")
+except RuntimeError as e:
+    check("37.9b _after_block поднимает исключение при нарушенном инварианте (продакшен-режим)",
+          "SUPPLY INVARIANT VIOLATED" in str(e), str(e)[:100])
+bc.ENFORCE_SUPPLY_INVARIANT_PER_BLOCK = _saved_flag37
+bc.db.debit("BIO_TEST_37_INVARIANT", 777_00000000)  # clean up the injected money
+
+# 37.10 -- pubkey length check must be consistent across BOTH signature
+# re-verification paths: verify_signed_request (HTTP-facing) AND
+# verify_impulse_signature (peer-block path) -- found missing on the
+# second one during a later audit pass; a wrong-length pubkey there
+# should fail cleanly, not fall through to whatever pq.address()/verify()
+# happen to do with malformed-length bytes.
+class _FakeImpulse37:
+    pubkey_hex = "aa" * 100  # deliberately wrong length, not 1312 bytes
+    signature_hex = "00" * 76
+    sender = "BIO1SOMEADDRESS"
+    signed_timestamp = time.time()
+    nonce = 1
+    kind = "TRANSFER"
+    receiver = "BIO1OTHER"
+    value = 100
+    payload = ""
+check("37.10 verify_impulse_signature отклоняет неверную длину pubkey (путь приёма блока от пира)",
+      bc.Network.verify_impulse_signature(_FakeImpulse37()) is False)
+
+# 37.11 -- get_node_safe(): correct for both a real node and a missing
+# address, and takes _chain_lock (structural check, since timing the
+# actual race is impractical in a single-threaded test).
+_addr37c = "BIO_TEST_37_NODESAFE"
+_node37c = bc.Node(_addr37c, 1)
+bc.net.nodes[_addr37c] = _node37c
+check("37.11 get_node_safe находит существующую ноду",
+      bc.net.get_node_safe(_addr37c) is _node37c)
+check("37.12 get_node_safe возвращает None для несуществующего адреса",
+      bc.net.get_node_safe("BIO_DOES_NOT_EXIST_37") is None)
+del bc.net.nodes[_addr37c]
+bc.net._rebuild_death_schedule()
+_src37_11 = __import__("inspect").getsource(bc.Network.get_node_safe)
+check("37.11b get_node_safe берёт _chain_lock",
+      "_chain_lock" in _src37_11)
+
+# 37.13 -- governance global state must roll back even when the
+# exception originates INSIDE _governance_tick itself, after it has
+# already mutated a global -- not just when the failure is elsewhere in
+# the block and _governance_tick itself succeeds cleanly.
+_orig_gov_tick37 = bc._governance_tick
+_saved_emerge37 = bc.EMERGE_THRESHOLD
+def _fake_gov_tick_37(now):
+    bc.EMERGE_THRESHOLD = 999
+    raise RuntimeError("simulated bug inside governance_tick")
+bc._governance_tick = _fake_gov_tick_37
+_fake_block37 = type("FakeBlock37b", (), {"t": time.time(), "index": 1})()
+bc.net._after_block(_fake_block37, "BIO_TEST_37_GOVROLLBACK_A", "BIO_TEST_37_GOVROLLBACK_B", 0)
+check("37.13 EMERGE_THRESHOLD откатывается даже при сбое внутри самого governance_tick",
+      bc.EMERGE_THRESHOLD == _saved_emerge37, f"got {bc.EMERGE_THRESHOLD}, expected {_saved_emerge37}")
+bc._governance_tick = _orig_gov_tick37
+bc.EMERGE_THRESHOLD = _saved_emerge37
+
+# 37.14 -- route-binding sanity check: catches an entire CLASS of bug the
+# rest of this suite structurally cannot, since every other check here
+# calls Python functions directly, never through the actual FastAPI
+# decorator/routing layer. Found today: @app.get("/verify") had landed
+# on _check_supply_invariant (an internal helper returning a bare tuple)
+# instead of verify() itself, during an earlier refactor -- /verify was
+# serving raw internal numbers as a JSON list to anyone who called it,
+# and verify()'s real chain-integrity check was dead, unreachable code.
+# 252 direct-call tests all stayed green throughout, because none of
+# them go through app.routes the way a real HTTP request does.
+if isinstance(getattr(bc.app, "routes", None), dict):
+    check("37.14a GET /verify действительно вызывает bc.verify, не внутренний хелпер",
+          bc.app.routes.get(("GET", "/verify")) is bc.verify)
+    check("37.14b GET /balance действительно вызывает bc.balance",
+          bc.app.routes.get(("POST", "/balance")) is bc.balance)
+    check("37.14c POST /tx действительно вызывает bc.tx",
+          bc.app.routes.get(("POST", "/tx")) is bc.tx)
+    check("37.14d GET /chain действительно вызывает bc.chain",
+          bc.app.routes.get(("GET", "/chain")) is bc.chain)
+    check("37.14e GET /events действительно вызывает bc.events",
+          bc.app.routes.get(("GET", "/events")) is bc.events)
+    check("37.14f POST /peer/announce действительно вызывает bc.peer_announce",
+          bc.app.routes.get(("POST", "/peer/announce")) is bc.peer_announce)
+else:
+    print("  [SKIP] 37.14 -- реальный fastapi в этом окружении, мок с отслеживанием routes не активен")
+
+print(f"\n=== ИТОГ (включая раздел 37): {len(PASS)} PASS / {len(FAIL)} FAIL ===")
+if FAIL:
+    print("Провалены:"); [print("  -", f) for f in FAIL]
+    sys.exit(1)
+print("ВСЯ INT-РЕГРЕССИЯ ЧИСТАЯ, ВКЛЮЧАЯ ВСЕ РАУНДЫ АУДИТА.")

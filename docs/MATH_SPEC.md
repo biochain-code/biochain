@@ -9,19 +9,52 @@ All monetary values are integers in **satoshis** (`sat`). `1 BIO = 10^8 sat`. Th
 ## 0. Signature Scheme and Address Derivation
 
 ```
-address(pk) = "BIO1" + SHA3-256(pk)[:16].upper()
+address(pk) = "BIO1" + SHA3-256(pk)[:32].upper()
 ```
 
-Every address that has ever existed on BioChain is ML-DSA-44 (CRYSTALS-Dilithium3, FIPS 204) — no ECDSA fallback, no hybrid mode. This is a deliberate choice, not a temporary one: ML-DSA is already fully NIST-standardized, unlike newer, still-evolving candidates such as FAEST or HAWK.
+**Address length changed 16 → 32 hex chars (64 → 128 bits), 2026-07-28,
+coordinated with a full network genesis reset — not a backward-compatible
+change.** The 64-bit version was a real, if impractical-today, weakness:
+a targeted second-preimage attack against one specific existing address
+needed ~2^64 attempts (not the ~2^32 birthday bound, which only finds
+*some* collision among an attacker's own freshly-generated keys and
+grants no access to anyone else's funds — the two are frequently
+conflated and are not the same threat model). At 128 bits the same
+targeted attack needs ~2^128 — including Grover's quadratic quantum
+speedup, which brings the *effective* difficulty down to ~2^64, this
+stays firmly in "not achievable by any realistic adversary, today or
+for a long horizon" territory, unlike the 64-bit original.
+
+This intentionally did NOT go through the scheme_id agility mechanism
+described below (which exists precisely for changes like this) — the
+`"MLDSA44"` scheme's own formula was changed directly, wallet and
+backend updated in lockstep, and the chain reset to genesis rather than
+carrying old-format addresses forward. That was the pragmatic call
+specifically because the network was still small enough (two nodes, no
+third-party wallets, no real economic activity yet) to reset cleanly;
+it should not be read as the template for a *future* format change,
+which should use a new scheme_id instead and avoid a reset.
+
+Every address that has existed on BioChain since this reset is ML-DSA-44
+(CRYSTALS-Dilithium3, FIPS 204) — no ECDSA fallback, no hybrid mode.
+This is a deliberate choice, not a temporary one: ML-DSA is already
+fully NIST-standardized, unlike newer, still-evolving candidates such as
+FAEST or HAWK.
 
 **Cryptographic agility foundation (v5.40):**
 
 ```
-address(pk, scheme_id="MLDSA44") = "BIO1" + SHA3-256(pk)[:16].upper()          -- unchanged formula
-address(pk, scheme_id=X≠"MLDSA44") = "BIO1" + SHA3-256(X + pk)[:16].upper()    -- any future scheme
+address(pk, scheme_id="MLDSA44") = "BIO1" + SHA3-256(pk)[:32].upper()          -- the current default formula
+address(pk, scheme_id=X≠"MLDSA44") = "BIO1" + SHA3-256(X + pk)[:32].upper()    -- any future scheme
 ```
 
-`scheme_id` defaults to `"MLDSA44"` everywhere it is not explicitly passed, so every address ever created continues to resolve identically — this is proven by direct byte-for-byte comparison against the original formula in the regression suite, not merely assumed. A future scheme's `scheme_id` is folded into the hash, guaranteeing no address collision with an ML-DSA-44 address is possible even given identical raw key bytes.
+`scheme_id` defaults to `"MLDSA44"` everywhere it is not explicitly
+passed. As of the 2026-07-28 reset above, this default formula is no
+longer a historical constant carried unchanged since launch — see the
+note above for why this one instance changed the default directly
+instead of adding a new scheme_id. A future scheme's `scheme_id` is
+folded into the hash, guaranteeing no address collision with an
+ML-DSA-44 address is possible even given identical raw key bytes.
 
 This lays groundwork only — no wallet, API endpoint, or verification path currently passes anything other than the default. Adding a second scheme later (a hash-based candidate such as SLH-DSA/FIPS 205 would be the most independent choice, chosen specifically for its security assumption being mathematically unrelated to ML-DSA's lattice-based one) would require wiring `scheme_id` through the relevant endpoints and a new `wallets.sig_scheme` column value for opted-in wallets, but never a new genesis and never breaking a single existing address.
 
@@ -263,7 +296,20 @@ MIN_EMERGENCE_SPAN_SECONDS = 7 × 86,400   (7 days; governable, floor 1 day)
 energy_per_impulse = 8.0 × role_bonus(address)
 
 energy_decay_per_block = 0.02
+
+ENERGY_DEATH = 5.0
 ```
+
+**Fixed-point since v5.43 (BC-001, July 2026):** `energy`, `reputation`,
+`recent_activity`, and `risk` are stored and computed as exact integers
+scaled by `CONSENSUS_SCALE = 1,000,000` internally (e.g. `energy = 8.0`
+is stored as `8,000,000`), not as `float`. The values and formulas below
+are given in their real-world (unscaled) meaning; the scaling is a pure
+implementation detail chosen specifically so two independent peers can
+never compute even a single-bit-different result for the same inputs,
+which `float` does not strictly guarantee across CPU architectures. The
+one formula that does NOT reduce to simple integer arithmetic is the
+multiplicative `recent_activity` decay below (`0.95^elapsed`, see note).
 
 A node is born the moment BOTH hold:
 
@@ -284,8 +330,23 @@ energy(t+1) = max( energy(t) - 0.02 + Σ(new impulses at t) × 8.0 × role_bonus
 ```
 
 ```
-alive(t) = energy(t) > 0
+alive(t) = energy(t) > ENERGY_DEATH   (i.e. energy(t) > 5.0, not > 0)
 ```
+
+This threshold was already `5.0` in the running code before this
+revision; this document previously (incorrectly) stated `> 0` here —
+corrected to match, not a behavior change.
+
+**`recent_activity` decay** (used in `weight()`, §6a) is multiplicative,
+not additive: `recent_activity(t+1) = recent_activity(t) × 0.95^elapsed`.
+Implemented as an exact integer ratio (`0.95 = 19⁄20` precisely, so
+`× 19^elapsed ÷ 20^elapsed`, integer division, no rounding drift), with
+one bounded exception: for `elapsed ≥ 512` blocks since last touched,
+the result is set directly to `0` rather than computed — at
+`CONSENSUS_SCALE` precision, `0.95^512` is already smaller than the
+smallest representable unit, so this is exact, not an approximation,
+and avoids computing a needlessly enormous exact integer power for a
+node that hasn't been touched in a long time.
 
 A node with `alive(t) = false` for `365` consecutive days has its balance swept:
 
@@ -605,6 +666,215 @@ against the exact file now running in production (hash confirmed
 identical on both servers). Deployed to server1 and server2 on July 21,
 2026; a real-traffic observation period is in progress on both before
 this is considered fully closed out.
+
+---
+
+
+## 15. Security Hardening (July 2026) — DEPLOYED July 28, 2026
+
+Prompted by several independent rounds of automated code review between
+July 26 and July 28, 2026 — each round re-analyzed against the actual
+current file, not a cached earlier version, since several findings
+across the rounds turned out to describe a version already superseded
+by an earlier fix in the same review cycle. A meaningful fraction of
+findings across all rounds were investigated and found to already be
+correctly handled, or to describe a materially different, less severe
+issue than first stated once checked directly against the running code
+and, where practical, verified with a real reproduction rather than
+accepted on the finding's own description — that verification discipline
+is itself part of what's being reported here, not a footnote to it.
+Findings confirmed real are grouped below by what they actually protect
+against, not by which review round raised them.
+
+**Per-block supply invariant enforcement.** The five-bucket check in §1
+was previously only ever run on demand, via `/verify`. It now also runs
+automatically after every single block, in production, using the same
+`_check_supply_invariant()` code `/verify` itself calls — not a
+duplicate. If it fails, the entire block is rolled back (database and
+in-memory state together) before it is ever persisted or relayed to a
+peer, via the same rollback path a rejected transaction already used.
+Cheap enough to run unconditionally at current and near-future network
+size (one `SUM()` per money-holding table, not a function of chain
+length). Test fixtures that deliberately inject unbalanced test-only
+funds via direct database writes (a long-standing, narrow testing
+shortcut, not a code path reachable from any API) explicitly disable
+this check for their own run only; production default is always
+enforced.
+
+**Governance-parameter rollback.** A governance vote's effect on
+in-process global parameters (`EMERGE_THRESHOLD`, fee rates, stake-tier
+thresholds, and similarly governed values) is now snapshotted before
+application and restored if anything fails partway through applying it
+— including a failure originating inside the application logic itself,
+not only failures elsewhere in the same block. Verified directly: forcing
+a fault mid-application and confirming the affected parameter reverts to
+its exact pre-vote value, not merely close to it.
+
+**Reward-payout atomicity via SQLite SAVEPOINT.** Longevity rewards (§7)
+and unstake payouts each touch two different tables — crediting a
+wallet's balance and marking that specific reward as paid are now
+wrapped in a single SQLite `SAVEPOINT`, so a fault between the two
+undoes both together, at the database level, rather than risking a
+credited-but-unmarked state that a later block's tick could pay out a
+second time. This is narrower and more surgical than wrapping the
+entire multi-node reward pass in one transaction, deliberately: a
+persistent fault specific to one node's data must not be able to make
+every future block fail the same way and stall the chain indefinitely
+— each node's own reward attempt is now atomic on its own, while a
+fault on one node still leaves every other node's payout that block
+unaffected, and the chain continues producing blocks. Founder-vesting
+payout (§2a), by contrast, is deliberately *not* wrapped this way: it
+touches only one recipient per attempt (not a loop over many nodes, so
+the stall risk above does not apply the same way), and a fault there
+is now allowed to propagate to the full block-level rollback instead
+— the safer choice specifically because vesting's credit step happens
+before its own "already paid" bookkeeping step, so only a full rollback
+of both together, not a locally-scoped save, correctly prevents a
+double payout there.
+
+**Peer-block validator re-verification.** Receiving a block from a peer
+already re-verified that its claimed validator was the legitimate,
+deterministically-selected one (§3.2b of the Whitepaper). It now also
+re-verifies that the same validator would have cleared the
+finalization-weight threshold (`can_finalize`, §6a) — the same bar a
+locally-originated block must clear before it can finalize instead of
+falling back to bootstrap-mode processing. Previously, a correctly-
+selected validator that did not clear this bar could still have its
+peer-relayed block accepted, since only selection legitimacy was
+checked on receipt, not the finalization bar itself.
+
+**Sybil-resistant self-announcement.** `POST /peer/announce` (§12a)
+previously accepted a bare URL with no proof of anything. It now
+requires the same kind of signed request every fund-affecting endpoint
+already requires — address, public key, ML-DSA-44 signature, timestamp,
+and a strictly-increasing nonce, verified exactly as any other signed
+request is (§0). This doesn't change what self-announcement itself
+grants (still zero trust on its own — see §12a), but it does mean
+producing even one announcement now costs a real ML-DSA-44 keypair and
+signature, not just an HTTP request with a string in it — raising the
+cost of flooding the candidate list, independent of and in addition to
+the majority-confirmation requirement that already gates actual
+promotion.
+
+**DNS-rebinding protection for automatic HTTP peer promotion.** Before
+this fix, verifying a candidate URL's safety (rejecting loopback,
+private, and link-local targets, including the cloud-metadata address)
+and then making the actual liveness-check request were two separate
+steps, each independently resolving the hostname — a malicious DNS
+server could answer safely for the first resolution and differently for
+the second, bypassing the check entirely. The liveness-check request
+now connects directly to the exact IP already verified safe (with a
+`Host` header preserving correct routing on the peer's side), closing
+that window completely for `http://` candidates. `https://` candidates
+are a deliberate, disclosed exception: substituting a verified IP into
+an HTTPS request breaks TLS certificate-hostname validation, and
+disabling certificate verification to work around that would be worse
+than the narrow window it would close. `https://` candidates therefore
+still resolve the hostname once at the connection itself, same as
+before this fix — an accepted, narrower residual, not an oversight.
+This applies specifically to the *promotion-verification* HTTP request;
+it does not weaken or bypass the cryptographic verification every piece
+of actual chain data still undergoes regardless of which peer sent it
+(§12) — a peer being wrongly promoted could at most cause one
+liveness-check request to reach an unintended target, never accepted or
+propagated bad chain data.
+
+**Fork-resolution rate limiting.** A peer claiming a fork now triggers
+at most one deep fork-resolution attempt (full paginated fetch plus
+isolated-database replay) per peer per five-minute window. A single
+misbehaving or merely flaky peer can no longer force this comparatively
+expensive path on every sync cycle; a genuine fork is still resolved,
+just not re-attempted against the same peer faster than once per
+window.
+
+**Public-key length validation, made consistent.** Every signature
+re-verification path now explicitly checks the submitted public key is
+exactly 1,312 bytes (the fixed ML-DSA-44 public key size) before using
+it, rather than relying on the underlying cryptographic library to
+reject a malformed-length key downstream. This was already true for the
+main HTTP-facing signature check; a second, independent re-verification
+path used specifically when applying a peer's block was found missing
+the same check and has been brought in line.
+
+**Halt, don't warn, on detected local database corruption.** If a
+node's own restart-time chain reload finds a broken hash link between
+two adjacent local blocks — meaning the local database itself has been
+corrupted, not a peer-sync disagreement — the node now refuses to start
+at all, with a clear message pointing at the most recent automated
+backup (§ "Backups" in the Whitepaper's Implementation Stack table), and
+exits immediately. Previously it logged a warning and continued running
+on the corrupted chain regardless.
+
+**Thread-safe single-address state lookups.** Two read endpoints
+(`/balance`, and `/tx`'s response formatting) previously read node state
+directly from a shared in-memory structure without taking the lock that
+already protects it elsewhere — safe under ordinary load, but capable
+of observing a transient empty-or-partially-rebuilt view specifically
+during the narrow window a fork-resolution adoption is actively
+replacing that same structure. A new, single-purpose thread-safe lookup
+closes this for both endpoints without the cost of copying the entire
+node set the way the existing bulk-read path already safely does for
+list-returning endpoints (`/nodes`, `/dashboard`, `/validators`,
+`/longevity`), which were already correctly using it and needed no
+change.
+
+**Graceful shutdown and stalled-checkpoint visibility.** The three
+long-running background loops (peer sync, gossip, signature pruning)
+now check a shared shutdown flag instead of running an unconditional
+`while True`, and the process now installs `SIGTERM`/`SIGINT` handlers
+that set this flag and trigger one final WAL checkpoint before actually
+exiting — verified directly: killed and restarted five times in a row
+under real `SIGTERM`, real `SIGKILL` (immediately after startup, mid
+genesis-pool writes), and a real, unrelated concurrent read transaction
+forcing a checkpoint to report itself busy, all on the actual production
+hardware, with zero chain-integrity warnings on any subsequent restart.
+The periodic WAL checkpoint (§14) now also explicitly logs when SQLite
+reports it as only partially completed (`busy`), rather than silently
+discarding that status — the next scheduled checkpoint still completes
+it; this only makes an already-recovering condition visible rather than
+invisible.
+
+**Fast state-sync left disabled, not merely unfinished.** State-snapshot
+fast sync (§11's mechanism, intended to let a new node skip full chain
+replay) has a real, identified gap: the block table is deliberately
+excluded from the snapshot for size reasons, but nothing yet
+re-establishes the local chain's *length* after adopting a snapshot,
+so a subsequent ordinary sync would currently re-fetch and re-apply the
+entire real chain from block zero on top of already-current snapshot
+balances. This was found, understood precisely, and is disabled outright
+(`FAST_SYNC_ENABLED = False`) rather than shipped in a half-working
+state — ordinary block-by-block sync, which does not have this gap, is
+unaffected and remains the only sync path a new node uses today. A
+correct fix needs the local chain populated with placeholder entries
+carrying the real hash at the snapshot boundary specifically, so a
+block received immediately afterward can still validate its own
+`prev_hash` correctly — scoped, understood, and deliberately deferred
+rather than rushed.
+
+**Regression coverage.** The suite grew from 194 checks (§14) to 253,
+covering every fix above individually, each confirmed both against a
+lightweight crypto stub (fast iteration during development) and,
+separately, against the real ML-DSA-44 backend on actual production
+hardware — the full 253-check run completing with zero failures on
+server1's real liboqs backend is what is now confirmed, not merely the
+stub-backed version. A structural class of bug the rest of the suite
+cannot catch by construction — an HTTP route decorator silently bound to
+the wrong function, since every other check calls Python functions
+directly rather than through FastAPI's own routing layer — is now
+separately checked by directly inspecting the live route table itself;
+this exact bug was caught by writing that check, not found first and
+tested after the fact.
+
+**A full network genesis reset accompanied this work** (§0), timed to
+land together with the address-length change above while the network
+was still small enough to reset cleanly. Both production servers were
+stopped, backed up, updated, reset to a fresh genesis under the new
+address format, and restarted; peer-to-peer synchronization between the
+two independently-operated nodes (§8 of the Whitepaper) was re-confirmed
+immediately afterward on live production infrastructure — a real
+transaction submitted on server1 was independently observed, correctly
+credited, on server2 through ordinary peer sync alone, with no
+intervention on server2's side.
 
 ---
 

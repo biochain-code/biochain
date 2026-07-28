@@ -3,7 +3,7 @@
 // see the LICENSE file in this wallet's own directory for the full text and reasoning.
 import { useState, useEffect, useCallback, useRef } from "react";
 
-const VERSION   = "2.2.7";
+const VERSION   = "2.2.9";
 // v2.2.7: TRANSACTION HISTORY was displaying the sender's gross value
 // for RECEIVED transfers, not what actually landed in this wallet --
 // the server credits (value - fee) to the receiver while debiting the
@@ -506,12 +506,12 @@ async function generateRealKeypair(){
   return { publicKey: kp.publicKey, secretKey: kp.secretKey };
 }
 
-// Must match the backend EXACTLY: "BIO1" + sha3_256(pubkey_bytes)[:16].upper()
+// Must match the backend EXACTLY: "BIO1" + sha3_256(pubkey_bytes)[:32].upper()
 // (see pq.address() in biochain.py) -- verified byte-identical on real device.
 async function addressFromPubkey(pubkeyBytes){
   const sha3_256 = await getSha3_256();
   const hashHex = sha3_256(pubkeyBytes);
-  return "BIO1" + hashHex.slice(0,16).toUpperCase();
+  return "BIO1" + hashHex.slice(0,32).toUpperCase();
 }
 
 // Signs `messageStr` exactly as the backend expects it (see verify_signed_request
@@ -1154,8 +1154,8 @@ export default function BiochainWallet(){
     document.body.style.background = C.bg;
     document.body.style.margin = "0";
     document.body.style.minHeight = "100vh";
-    document.documentElement.style.overscrollBehaviorY = "none";
-    document.body.style.overscrollBehaviorY = "none";
+    document.documentElement.style.overscrollBehaviorY = "contain";
+    document.body.style.overscrollBehaviorY = "contain";
     document.body.style.touchAction = "pan-x pan-y";
   },[settings.theme]);
   const {copied,copy} = useCopy();
@@ -1393,7 +1393,9 @@ export default function BiochainWallet(){
     const secretKey=base64ToBytes(skB64);
     const publicKey=base64ToBytes(stored.pubkeyB64);
     keyRef.current={publicKey,secretKey};
-    setWallet({address:stored.address,wordCount:stored.wordCount??24});
+    const address=await addressFromPubkey(publicKey); // recomputed fresh, not
+    // trusted from stored.address -- see the same note in handleRestore.
+    setWallet({address,wordCount:stored.wordCount??24});
     setScreen("main");
   }
 
@@ -1507,7 +1509,10 @@ export default function BiochainWallet(){
       const seedStr=words.join(" ");
       const kp=await importKeystore(restoreKeystoreText,seedStr);
       keyRef.current={publicKey:kp.publicKey,secretKey:kp.secretKey};
-      const address=kp.address; // from the keystore file -- matches the address derived from this pubkey at creation
+      const address=await addressFromPubkey(kp.publicKey); // always recomputed from the
+      // decrypted pubkey via the CURRENT formula -- never trust a value baked into an
+      // older keystore file, since that reflects whatever formula was current when the
+      // file was created, not necessarily the one running now.
 
       const skB64=bytesToBase64(kp.secretKey);
       const pkB64=bytesToBase64(kp.publicKey);
