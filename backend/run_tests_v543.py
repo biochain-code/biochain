@@ -254,12 +254,12 @@ nonce += 1
 # отправитель здесь ЕДИНСТВЕННЫЙ живой узел => он же валидатор и получил
 # reward обратно; проверяем каждую компоненту точно, в сатах
 reward = blk.reward if blk else 0
-check("8.1a получатель получил ровно value-fee",
-      blk is not None and db.get_balance("BIO1BBB") - rcv_before == val - fee_expected,
-      f"got {db.get_balance('BIO1BBB')-rcv_before}, want {val-fee_expected}")
-check("8.1b отправитель: -value +reward точно",
-      blk is not None and db.get_balance(addr) - bal_before == reward - val,
-      f"diff={db.get_balance(addr)-bal_before}, want {reward-val}")
+check("8.1a получатель получил ровно полный value (получатель больше не платит комиссию)",
+      blk is not None and db.get_balance("BIO1BBB") - rcv_before == val,
+      f"got {db.get_balance('BIO1BBB')-rcv_before}, want {val}")
+check("8.1b отправитель: -(value+fee) +reward точно (отправитель платит комиссию сверху)",
+      blk is not None and db.get_balance(addr) - bal_before == reward - val - fee_expected,
+      f"diff={db.get_balance(addr)-bal_before}, want {reward-val-fee_expected}")
 check("8.1c fee учтён в burned точно",
       bc.net.emission.burned - burn_before == fee_expected)
 
@@ -2024,3 +2024,29 @@ if FAIL:
     print("Провалены:"); [print("  -", f) for f in FAIL]
     sys.exit(1)
 print("ВСЯ INT-РЕГРЕССИЯ ЧИСТАЯ, ВКЛЮЧАЯ ВСЕ РАУНДЫ АУДИТА.")
+
+# 37.15 -- fee model consensus safety (2026-07-29 change: sender now pays
+# value+fee, receiver gets full value). The debit side has TWO independent
+# copies of this arithmetic (send() for locally-created blocks,
+# _apply_peer_block_locked() for blocks received from a peer) -- if these
+# two ever drift apart, two honest nodes could compute different balances
+# for the identical transaction, a real chain-split risk. This checks both
+# copies use the textually identical "value + fee" expression, not just
+# that they happen to agree today. The credit side has no such risk by
+# construction -- _apply_impulse_effect() is a single shared function,
+# called from both paths, not a third duplicated copy.
+import inspect as _inspect37_15
+_src_send37 = _inspect37_15.getsource(bc.Network.send)
+_src_peer37 = _inspect37_15.getsource(bc.Network._apply_peer_block_locked)
+check("37.15a send() списывает value+fee с отправителя (новая модель, 2026-07-29)",
+      "total_debit = value + fee" in _src_send37)
+check("37.15b _apply_peer_block_locked() использует ТУ ЖЕ формулу дословно",
+      "total_debit = value + fee" in _src_peer37)
+check("37.15c credit получателю -- одна общая функция, не дублирована",
+      _inspect37_15.getsource(bc.Network._apply_impulse_effect).count("db.credit(imp.receiver, imp.value)") == 1)
+
+print(f"\n=== ИТОГ (включая раздел 37.15): {len(PASS)} PASS / {len(FAIL)} FAIL ===")
+if FAIL:
+    print("Провалены:"); [print("  -", f) for f in FAIL]
+    sys.exit(1)
+print("МОДЕЛЬ КОМИССИИ СОГЛАСОВАНА МЕЖДУ ОБОИМИ ПУТЯМИ ПРИМЕНЕНИЯ БЛОКА.")

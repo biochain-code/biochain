@@ -51,6 +51,15 @@ CHAIN_HOT_WINDOW = 50_000
 REBIRTH_THRESHOLD   = EMERGE_THRESHOLD
 
 TEAM_ADDRESS    = "BIO139339DE8FA6942951AF6A7DC91A2752A"
+# Separate from TEAM_ADDRESS on purpose (2026-08-02): TEAM_ADDRESS is
+# still the founder's genesis identity -- used for the one-time genesis
+# grant/wallet-registration carve-out (inert now, guarded to first boot
+# only) and the /state display of the founder's active balance.
+# VESTING_RECIPIENT_ADDRESS is where the monthly vesting payout actually
+# goes -- a separate, colder address the founder controls but doesn't
+# use for day-to-day operations, so the bulk of long-term proceeds never
+# touches the actively-used wallet.
+VESTING_RECIPIENT_ADDRESS = "BIO1297800034048D37203FB382E86FE763F"
 SAT_PER_BIO = 100_000_000
 
 def bio_to_sat(amount) -> int:
@@ -1923,7 +1932,7 @@ class Emission:
 class Vesting:
     """5% of emission -- to the developer."""
     def __init__(self):
-        db.init_vesting(TEAM_ADDRESS)
+        db.init_vesting(VESTING_RECIPIENT_ADDRESS)
         row = db.get_vesting()
         self.start_time     = row["start_time"] if row else time.time()
         self.claimed_months = row["claimed_months"] if row else 0
@@ -1957,16 +1966,16 @@ class Vesting:
         for m in range(self.claimed_months + 1, self.claimed_months + unpaid_months + 1):
             amount += FINAL_MONTH_PAYOUT if m == VESTING_MONTHS else MONTHLY_PAYOUT
         amount = min(amount, emission.pools["team"])
-        db.ensure_wallet(TEAM_ADDRESS)
-        db.credit(TEAM_ADDRESS, amount)
+        db.ensure_wallet(VESTING_RECIPIENT_ADDRESS)
+        db.credit(VESTING_RECIPIENT_ADDRESS, amount)
         emission.pools["team"] -= amount
         emission.minted         += amount
         self.claimed_months     += unpaid_months
         self.total_claimed      += amount
         db.save_vesting(self.claimed_months, self.total_claimed)
         db.log("VESTING_PAID",
-               f"{TEAM_ADDRESS} +{sat_to_bio(amount):.2f} BIO month #{self.claimed_months}")
-        print(f"[VESTING] +{sat_to_bio(amount):.2f} BIO -> {TEAM_ADDRESS} (month #{self.claimed_months}/{VESTING_MONTHS})")
+               f"{VESTING_RECIPIENT_ADDRESS} +{sat_to_bio(amount):.2f} BIO month #{self.claimed_months}")
+        print(f"[VESTING] +{sat_to_bio(amount):.2f} BIO -> {VESTING_RECIPIENT_ADDRESS} (month #{self.claimed_months}/{VESTING_MONTHS})")
         return amount
 
     def state(self, now: float = None) -> dict:
@@ -1975,7 +1984,7 @@ class Vesting:
         cliff_passed  = elapsed >= CLIFF_SECONDS
         months_passed = max(0, int((elapsed - CLIFF_SECONDS) / MONTH_SECONDS)) if cliff_passed else 0
         return {
-            "address":        TEAM_ADDRESS,
+            "address":        VESTING_RECIPIENT_ADDRESS,
             "cliff_passed":   cliff_passed,
             "cliff_days_left":max(0, int((CLIFF_SECONDS - elapsed) / 86400)),
             "months_paid":    self.claimed_months,
@@ -2709,11 +2718,12 @@ class Network:
 
                     if kind == "TRANSFER":
                         fee = transfer_fee(value)
-                        if value <= fee:
-                            raise _Reject(f"transfer too small to cover the network fee ({sat_to_bio(fee):.4f} BIO)")
+                        if value <= 0:
+                            raise _Reject("transfer value must be positive")
                         db.ensure_wallet(receiver)
-                        if not db.debit(sender, value):
-                            raise _Reject(f"insufficient BIO: have {sat_to_bio(db.get_balance(sender)):.4f}")
+                        total_debit = value + fee
+                        if not db.debit(sender, total_debit):
+                            raise _Reject(f"insufficient BIO: have {sat_to_bio(db.get_balance(sender)):.4f}, need {sat_to_bio(total_debit):.4f} ({sat_to_bio(value):.4f} + {sat_to_bio(fee):.4f} fee)")
                     elif kind == "STAKE":
                         total_debit = value + Emission.STAKE_FEE
                         if not db.debit(sender, total_debit):
@@ -3081,10 +3091,11 @@ class Network:
                 db.ensure_wallet(sender)
                 if kind == "TRANSFER":
                     fee = transfer_fee(value)
-                    if value <= fee:
-                        raise _Reject(f"transfer too small to cover the network fee ({sat_to_bio(fee):.4f} BIO)")
+                    if value <= 0:
+                        raise _Reject("transfer value must be positive")
                     db.ensure_wallet(receiver)
-                    if not db.debit(sender, value):
+                    total_debit = value + fee
+                    if not db.debit(sender, total_debit):
                         raise _Reject("sender has insufficient balance to apply this block")
                 elif kind == "STAKE":
                     total_debit = value + Emission.STAKE_FEE
@@ -3295,10 +3306,9 @@ class Network:
     def _apply_impulse_effect(self, imp):
         """What happens to a value once it's already locked/validated for this impulse's kind."""
         if imp.kind == "TRANSFER":
-            fee     = transfer_fee(imp.value)
-            net_amt = imp.value - fee
+            fee = transfer_fee(imp.value)
             self.emission.burn(fee)
-            db.credit(imp.receiver, net_amt)
+            db.credit(imp.receiver, imp.value)
         elif imp.kind == "STAKE":
             self.emission.burn(Emission.STAKE_FEE)
             existing     = db.get_stake(imp.sender)
@@ -4428,6 +4438,7 @@ def tx(body: TXBody):
             "validator": block.validator,
             "reward":    round(sat_to_bio(block.reward), 4),
             "fee":       sat_to_bio(transfer_fee(value_sat)),
+            "total_debited": sat_to_bio(value_sat + transfer_fee(value_sat)),
             "mode":      "bootstrap" if block.validator == "NETWORK" else "consensus",
         },
         "sender": {

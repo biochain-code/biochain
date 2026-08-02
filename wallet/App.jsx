@@ -3,78 +3,28 @@
 // see the LICENSE file in this wallet's own directory for the full text and reasoning.
 import { useState, useEffect, useCallback, useRef } from "react";
 
-const VERSION   = "2.2.9";
-// v2.2.7: TRANSACTION HISTORY was displaying the sender's gross value
-// for RECEIVED transfers, not what actually landed in this wallet --
-// the server credits (value - fee) to the receiver while debiting the
-// sender the full gross value, so every incoming entry overstated the
-// real amount by the fee. Found live: several small transfers made the
-// accumulated gap between "history says I received X" and "my balance
-// actually grew by Y" look like a real discrepancy, traced down to
-// this display bug rather than any accounting error. SENT entries were
-// already correct (sender really does pay exactly the gross value) and
-// are unchanged.
-// v2.2.6: API constant switched from a hardcoded absolute URL
-// (different per server) to a relative path ("/api") -- since nginx on
-// every server serves both the wallet's static files AND proxies /api
-// from the same origin, a relative path resolves correctly wherever the
-// page is loaded from. One single build now works on any server,
-// instead of a separate build per server that differed in exactly one
-// line. Found worth simplifying when asked why two near-identical
-// wallet files existed on GitHub.
-// v2.2.5: automatic, one-time wallet-registration grant (10 BIO,
-// first 100 wallets ever created). Fires silently right after a new
-// wallet is confirmed and saved locally -- see tryWalletRegistration()
-// and its call site in handleSaveAndOpen(). Failure (slots exhausted,
-// network issue) is deliberately silent -- this is a bonus, not
-// something the wallet's core function depends on.
-// v2.2.4: readability pass -- all UI font sizes bumped up (7->9, 8->10,
-// 9->11, 10->12, 11->13, 12->14, 13->14) for legibility on phone screens.
-// Large display numbers (balance, headers -- 16 and above) left untouched,
-// they were already prominent. Single-pass regex mapping avoided cascading
-// double-increments; SVG logo decoration (fontSize="N" attribute form)
-// is untouched by design, matched pattern only targets JS object syntax.
-// v2.2.3: biometric registration errors now show the real
-// WebAuthn exception (name + message) instead of a fixed generic
-// string -- needed to diagnose a real "Biometric registration
-// failed" report where the underlying cause was invisible.
-// v2.2.2: REAL bug found -- both the NETWORK and SWAP background-poll
-// effects checked screen!=="wallet", but the screen value after login
-// is actually "main" (see line ~1282, done correctly there). NETWORK
-// never had a duplicate direct call like the swap tab-switch buttons
-// do, so its effect never fired at all -- explains the permanent
-// "Loading..." with no error, since fetchDashboard was never called.
-// v2.2.1: dashboard fetch errors surfaced on screen instead of silently
-// swallowed -- needed to diagnose a real "stuck on Loading" report.
-// v2.2.0: NETWORK tab -- transparency dashboard reading GET /dashboard
-// (node counts, tier/role distribution, balance & stake concentration
-// among live nodes, synchronized-birth clusters as a weak Sybil-burst
-// signal). Honest limitation shown as-is from the server: no IP-based
-// farm detection exists anywhere in this architecture.
-// v2.1.1: removed the hardcoded want_asset="BTC" default entirely --
-// the offer form now has a real "what do you want" text field the
-// person fills in themselves. No asset name is assumed or suggested;
-// Bitcoin is not referenced anywhere in the wallet.
-// v2.1.0: swap UI decoupled from Bitcoin specifics. The Bitcoin/Taproot
-// path (spec v0.4) is shelved, not deleted -- priority moved to swaps
-// with future ML-DSA-compatible networks (spec v0.5). want_asset stays
-// a free-text field (server default "BTC" is harmless, unenforced by
-// consensus); wallet copy no longer hardcodes Bitcoin terminology so
-// the same screens work for whatever external asset comes first.
-// v2.0.1: fixed pubkey format in all five SWAP calls -- they sent
-// wallet.pubkeyB64 (base64) while every other signed endpoint (TX,
-// STAKE, etc.) sends bytesToHex(keyRef.current.publicKey). Two
-// different encodings of the same key would have failed every swap
-// call at the server's pubkey<->address check. Caught by a second,
-// targeted review pass -- not by the first build.
-// v2.0.0: HTLC atomic-swap UI (server v5.37). New SWAP tab with three
-// panels -- Order board / My deals / History -- backed by the in-chain
-// order board (SWAP_OFFER) and hash-locked escrow (SWAP_LOCK/CLAIM/
-// REFUND). The wallet handles ONLY the BioChain side; the external
-// asset's own wallet handles its own side -- the preimage is the only
-// thing that ever crosses between the two. One-time money-until-
-// revealed, kept only in memory during an active deal, never in the
-// seed backup.
+const VERSION   = "2.3.0";
+// v2.3.0: fee now paid by sender on top (value+fee debited), full value
+// credited to receiver -- matches server change 2026-07-29. Transaction
+// history updated to match (SENT shows value+fee, RECEIVED shows value).
+// v2.2.7: transaction history RECEIVED amount no longer subtracts fee
+// (server behavior changed; see v2.3.0 above -- this note is obsolete).
+// v2.2.6: API URL switched from hardcoded absolute to relative path --
+// one build now works on any server.
+// v2.2.5: automatic one-time wallet-registration grant (10 BIO, first
+// 100 wallets), fires silently on wallet creation.
+// v2.2.4: UI font-size readability pass for phone screens.
+// v2.2.3: biometric registration errors show the real WebAuthn exception.
+// v2.2.2: fixed NETWORK/SWAP background poll checking the wrong screen
+// name, which silently prevented dashboard data from ever loading.
+// v2.2.1: dashboard fetch errors now surfaced on screen, not swallowed.
+// v2.2.0: NETWORK tab -- transparency dashboard (GET /dashboard).
+// v2.1.1: removed hardcoded want_asset="BTC" default; free-text field.
+// v2.1.0: swap UI decoupled from Bitcoin specifics (Taproot path shelved).
+// v2.0.1: fixed pubkey encoding mismatch in SWAP calls (was base64,
+// needed hex like every other signed endpoint).
+// v2.0.0: HTLC atomic-swap UI (server v5.37) -- Order board / My deals /
+// History, hash-locked escrow.
 const EXT_UNIT = 100_000_000;   // 8-decimal display scale for external-asset amounts
 
 // SHA-256 hex of a hex-string preimage (mirrors server: bytes.fromhex -> sha256)
@@ -818,6 +768,23 @@ function clearWallet(){
   setActiveAddress(remaining.length ? remaining[0] : null);
 }
 function switchWallet(addr){ setActiveAddress(addr); }
+// Removes a specific saved wallet by address, whether or not it's the
+// currently active one -- unlike clearWallet() above, which only ever
+// touches whatever's currently active. If the deleted wallet WAS active,
+// falls back the same way clearWallet() does (another saved wallet, or
+// a clean slate); if it wasn't, the active session is untouched.
+function deleteWalletByAddress(addr){
+  const wasActive = getActiveAddress() === addr;
+  const wallets = loadAllWallets();
+  delete wallets[addr];
+  saveAllWallets(wallets);
+  if(wasActive){
+    localStorage.removeItem(BIO_KEY);
+    const remaining = Object.keys(wallets);
+    setActiveAddress(remaining.length ? remaining[0] : null);
+  }
+  return wasActive;
+}
 function walletExists(){
   migrateLegacyWallet();
   return Object.keys(loadAllWallets()).length > 0;
@@ -1749,6 +1716,17 @@ export default function BiochainWallet(){
     setWallet(null); setSeedWords([]); setHistory([]); setLoginPwd("");
     setScreen("start");
   }
+  function handleDeleteWalletFromList(addr){
+    if(!confirm(`Delete ${addr.slice(0,12)}...${addr.slice(-4)} from this device? Make sure you have its seed phrase backed up -- this cannot be undone here.`)) return;
+    const wasActive = deleteWalletByAddress(addr);
+    if(wasActive){
+      keyRef.current=null;
+      setWallet(null); setSeedWords([]); setHistory([]);
+      setScreen(walletExists()?"wallets":"start");
+    }else{
+      setMsg({type:"ok",text:"Wallet removed from this device."});
+    }
+  }
   async function handleInstall(){
     if(!installEvt) return;
     installEvt.prompt();
@@ -2248,10 +2226,14 @@ export default function BiochainWallet(){
                 <div style={{fontSize:10,color:C.green,marginTop:2}}>● ACTIVE NOW</div>
               )}
             </div>
-            {w.address!==wallet?.address&&(
-              <button style={{...sx.btn(C.cyan,true),fontSize:11,width:"auto",padding:"6px 14px"}}
-                onClick={()=>handleSwitchWallet(w.address)}>SWITCH</button>
-            )}
+            <div style={{display:"flex",gap:6}}>
+              {w.address!==wallet?.address&&(
+                <button style={{...sx.btn(C.cyan,true),fontSize:11,width:"auto",padding:"6px 14px"}}
+                  onClick={()=>handleSwitchWallet(w.address)}>SWITCH</button>
+              )}
+              <button style={{...sx.btn(C.red,true),fontSize:11,width:"auto",padding:"6px 10px"}}
+                onClick={()=>handleDeleteWalletFromList(w.address)}>🗑</button>
+            </div>
           </div>
         ))}
       </div>
@@ -2643,9 +2625,14 @@ export default function BiochainWallet(){
           <input id="send-amount" style={sx.inp()} placeholder="0.00" type="number" min="0"
             value={txAmt} onChange={e=>setTxAmt(e.target.value)}/>
           {txAmt&&parseFloat(txAmt)>0&&(
-            <div style={{fontSize:11,color:C.grey,marginTop:4,display:"flex",justifyContent:"space-between"}}>
-              <span>Fee: {(0.01 + parseFloat(txAmt)*0.0005).toFixed(4)} BIO fee</span>
-              <span style={{color:C.green}}>Gets: {Math.max(0, parseFloat(txAmt) - 0.01 - parseFloat(txAmt)*0.0005).toFixed(4)} BIO</span>
+            <div style={{fontSize:11,color:C.grey,marginTop:4}}>
+              <div style={{display:"flex",justifyContent:"space-between"}}>
+                <span>Fee: {(0.01 + parseFloat(txAmt)*0.0005).toFixed(4)} BIO</span>
+                <span style={{color:C.green}}>Recipient gets: {parseFloat(txAmt).toFixed(4)} BIO</span>
+              </div>
+              <div style={{textAlign:"right",marginTop:2}}>
+                <span style={{color:C.gold}}>Total debited from you: {(parseFloat(txAmt) + 0.01 + parseFloat(txAmt)*0.0005).toFixed(4)} BIO</span>
+              </div>
             </div>
           )}
           <button style={sx.btn(C.cyan)} onClick={handleSend} disabled={loading}>
@@ -2701,21 +2688,9 @@ export default function BiochainWallet(){
                 </div>
                 <div style={{textAlign:"right",marginLeft:8}}>
                   <div style={{fontSize:14,color:out?C.red:C.green,fontWeight:"bold"}}>
-                    {/* v2.2.7 fix: for RECEIVED transactions, the sender's
-                        gross value is NOT what actually landed in this
-                        wallet -- the server credits value-fee to the
-                        receiver (see biochain.py _apply_impulse_effect),
-                        while the sender is debited the full gross value.
-                        Showing raw tx.value for incoming transfers
-                        overstated every single receipt by the fee amount
-                        -- found live, after several small transfers made
-                        the accumulated gap look like a real discrepancy.
-                        The server already exposes tx.fee precisely for
-                        this; SENT stays as gross value (sender really
-                        does pay exactly that, no adjustment needed). */}
                     {out
-                      ? <>−{bl.tx?.value?.toFixed(2)} BIO</>
-                      : <>+{((bl.tx?.value??0)-(bl.tx?.fee??0)).toFixed(2)} BIO</>
+                      ? <>−{((bl.tx?.value??0)+(bl.tx?.fee??0)).toFixed(2)} BIO</>
+                      : <>+{(bl.tx?.value??0).toFixed(2)} BIO</>
                     }
                   </div>
                 </div>
