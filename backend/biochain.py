@@ -51,15 +51,8 @@ CHAIN_HOT_WINDOW = 50_000
 REBIRTH_THRESHOLD   = EMERGE_THRESHOLD
 
 TEAM_ADDRESS    = "BIO139339DE8FA6942951AF6A7DC91A2752A"
-# Separate from TEAM_ADDRESS on purpose (2026-08-02): TEAM_ADDRESS is
-# still the founder's genesis identity -- used for the one-time genesis
-# grant/wallet-registration carve-out (inert now, guarded to first boot
-# only) and the /state display of the founder's active balance.
-# VESTING_RECIPIENT_ADDRESS is where the monthly vesting payout actually
-# goes -- a separate, colder address the founder controls but doesn't
-# use for day-to-day operations, so the bulk of long-term proceeds never
-# touches the actively-used wallet.
-VESTING_RECIPIENT_ADDRESS = "BIO1297800034048D37203FB382E86FE763F"
+# TEAM_ADDRESS: genesis grant + /state display. VESTING_RECIPIENT_ADDRESS: monthly vesting payout, separate cold address.
+VESTING_RECIPIENT_ADDRESS = "BIO1F36F9E0995688660457FEA96FB358109"
 SAT_PER_BIO = 100_000_000
 
 def bio_to_sat(amount) -> int:
