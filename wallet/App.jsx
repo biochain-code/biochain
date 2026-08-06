@@ -2373,7 +2373,7 @@ export default function BiochainWallet(){
         <div style={{fontSize:12,color:C.grey,lineHeight:1.8}}>
           Version: {VERSION}<br/>
           API endpoint: {API}<br/>
-          ML-DSA-44 (Dilithium3) · AES-256-GCM · WebAuthn<br/>
+          ML-DSA-44 (Dilithium2) · AES-256-GCM · WebAuthn<br/>
         </div>
       </div>
       <div style={{margin:"10px 16px"}}>

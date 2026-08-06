@@ -10,7 +10,7 @@ A post-quantum Layer-1 blockchain where nodes are not registered or deployed —
 
 ## What makes this different
 
-- **Post-quantum from genesis.** Every signature uses ML-DSA-44 (CRYSTALS-Dilithium3, NIST FIPS 204) — not retrofitted onto an ECDSA chain, built with it from block zero.
+- **Post-quantum from genesis.** Every signature uses ML-DSA-44 (CRYSTALS-Dilithium2, NIST FIPS 204) — not retrofitted onto an ECDSA chain, built with it from block zero.
 - **Organic node emergence.** No staking-to-register, no permissioned validator set at launch. Activity itself creates nodes.
 - **Integer money, no exceptions.** All monetary values are satoshi-scale integers. The supply invariant (`wallets + pools + locked + staked + pending_unstakes == 21,000,000 BIO`) is checked with exact equality, not tolerance — any drift of even one satoshi is a bug, not a rounding error. As of July 28, 2026, this check also runs automatically after every block, not only on demand.
 - **Custody-free atomic swaps.** HTLC-based swaps (`SWAP_OFFER` / `SWAP_LOCK` / `SWAP_CLAIM` / `SWAP_REFUND`) between BIO and any external asset, with `want_asset` as free text — no hardcoded whitelist tying the protocol to any single external chain.
@@ -37,7 +37,7 @@ We document what actually broke and how it got fixed, not just what works when n
 
 | Component | Choice |
 |---|---|
-| Signature scheme | ML-DSA-44 (CRYSTALS-Dilithium3, NIST PQC standard) |
+| Signature scheme | ML-DSA-44 (CRYSTALS-Dilithium2, NIST PQC standard) |
 | Crypto backend | liboqs (C) via liboqs-python, with dilithium_py as a loud, required fallback — never silent |
 | Backend | Python 3.14, FastAPI + Uvicorn |
 | Database | SQLite (WAL mode, atomic transactions under RLock) |

@@ -36,7 +36,7 @@ it should not be read as the template for a *future* format change,
 which should use a new scheme_id instead and avoid a reset.
 
 Every address that has existed on BioChain since this reset is ML-DSA-44
-(CRYSTALS-Dilithium3, FIPS 204) — no ECDSA fallback, no hybrid mode.
+(CRYSTALS-Dilithium2, FIPS 204) — no ECDSA fallback, no hybrid mode.
 This is a deliberate choice, not a temporary one: ML-DSA is already
 fully NIST-standardized, unlike newer, still-evolving candidates such as
 FAEST or HAWK.
