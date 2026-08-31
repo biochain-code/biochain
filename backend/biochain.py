@@ -15,6 +15,7 @@ import os
 import secrets
 import heapq
 import math
+from biochain_facade import get_verifier
 from contextlib import contextmanager
 import copy
 
@@ -610,10 +611,10 @@ def verify_signed_request(address: str, pubkey_hex: str, signature_hex: str,
     if len(pubkey) != ML_DSA_44_PUBKEY_BYTES:
         return False, f"pubkey must be exactly {ML_DSA_44_PUBKEY_BYTES} bytes for ML-DSA-44 (got {len(pubkey)})"
 
-    if pq.address(pubkey) != address:
+    if get_verifier().address(pubkey) != address:
         return False, "pubkey does not match the claimed address"
 
-    if not pq.verify(pubkey, message, signature_hex):
+    if not get_verifier().verify(pubkey, message, signature_hex):
         return False, "invalid signature"
 
     return True, ""
@@ -2455,6 +2456,19 @@ class Network:
         self._alive_energy_sum = 0
         self._verified_up_to_index = -1
 
+    @property
+    def chain_height(self) -> int:
+        """The network's REAL current height -- always correct, even if
+        self.chain is sparse (e.g. after adopting a state snapshot that
+        seeded only an anchor block, not full history from 0). Unlike
+        len(self.chain), which is just "how many block objects happen
+        to be loaded in memory right now", this reads the actual index
+        of the chain's tip block and adds one. When self.chain is
+        genuinely contiguous from 0 (the normal case today), the two
+        values are identical -- this only diverges once snapshot-adopt
+        is used, which is exactly the scenario it exists to protect."""
+        return (self.chain[-1].index + 1) if self.chain else 0
+
     def _invalidate_alive_cache(self):
         self._alive_cache_dirty = True
 
@@ -2591,7 +2605,7 @@ class Network:
                     )
                 else:
                     node.energy = 15 * CONSENSUS_SCALE
-                node.state_block = len(self.chain)
+                node.state_block = self.chain_height
                 self._schedule_death(node, node.state_block)
                 self._alive_energy_sum += node.energy
                 db.save_node(node)
@@ -2620,7 +2634,7 @@ class Network:
         node.recent_activity = tx_count * CONSENSUS_SCALE
         node.age             = round(tx_count * 0.1, 1)
         node.energy          = 10 * CONSENSUS_SCALE + tx_count * ENERGY_PER_IMPULSE
-        node.state_block = len(self.chain)
+        node.state_block = self.chain_height
         self.nodes[address] = node
         self._note_new_node(address)
         self._schedule_death(node, node.state_block)
@@ -2669,7 +2683,7 @@ class Network:
             return False
         if len(pubkey) != ML_DSA_44_PUBKEY_BYTES:
             return False
-        if pq.address(pubkey) != impulse.sender:
+        if get_verifier().address(pubkey) != impulse.sender:
             return False
         signed_ts = getattr(impulse, "signed_timestamp", 0.0)
         nonce     = getattr(impulse, "nonce", 0)
@@ -2681,12 +2695,12 @@ class Network:
         )
         if message is None:
             return False
-        return pq.verify(pubkey, message, signature_hex)
+        return get_verifier().verify(pubkey, message, signature_hex)
 
     def _can_finalize(self, validator, impulse) -> bool:
         if not validator:
             return False
-        self.materialize_node(validator, len(self.chain))
+        self.materialize_node(validator, self.chain_height)
         S = self.eco.stability()
         W = validator.weight(self.eco.liquidity, self.eco.risk)
         return S > self.THETA_S and W > self.THETA_W and impulse.energy < self.THETA_I
@@ -2763,7 +2777,7 @@ class Network:
                         raise _Reject(f"unknown action kind: {kind}")
 
                     phi_bio_snap = self.phi_bio()
-                    imp = Impulse(sender, receiver, value, len(self.chain), phi_bio_snap, pubkey_hex, signature_hex, signed_timestamp, kind, payload, nonce)
+                    imp = Impulse(sender, receiver, value, self.chain_height, phi_bio_snap, pubkey_hex, signature_hex, signed_timestamp, kind, payload, nonce)
                     self.mempool.append(imp)
 
                     block, reason = self._mine()
@@ -2796,7 +2810,7 @@ class Network:
 
     def _after_block(self, block, sender: str, receiver: str, value: float):
         """Everything that happens after ANY block is appended -- whether it was just created locally (send/_mine) or received and validated from a peer (see /peer/block)."""
-        now_block = len(self.chain)
+        now_block = self.chain_height
         self._try_emerge(sender, block.t)
         if receiver != sender:
             self._try_emerge(receiver, block.t)
@@ -3026,8 +3040,8 @@ class Network:
                 payload   = block_data.get("imp_payload", "") or ""
                 if payload and len(payload) > PAYLOAD_MAX_CHARS:
                     raise _Reject(f"payload too large (max {PAYLOAD_MAX_CHARS} chars)")
-                if index != len(self.chain):
-                    raise _Reject(f"unexpected block index (expected {len(self.chain)}, got {index})")
+                if index != self.chain_height:
+                    raise _Reject(f"unexpected block index (expected {self.chain_height}, got {index})")
 
                 raw_imp = f"{kind}{sender}{receiver}{value}{timestamp}{index}{payload}"
                 expected_imp_id = hashlib.sha256(raw_imp.encode()).hexdigest()
@@ -3190,7 +3204,19 @@ class Network:
             return False, f"internal error while applying block: {e}"
 
     def _find_divergence_index(self, peer_blocks: list) -> int:
-        """Compares our chain against a peer's full block list (in /peer/chain format), index by index, and returns the index of the first block where the hashes differ."""
+        """Compares our chain against a peer's full block list (in /peer/chain format), index by index, and returns the index of the first block where the hashes differ.
+
+        KNOWN LIMITATION (not fixed in this pass): this compares by LIST
+        POSITION, not by real block height. If self.chain is ever sparse
+        (this node bootstrapped from a state snapshot rather than full
+        history from genesis -- see fast_sync_from_snapshot), list
+        position 0 no longer means "genesis", and this comparison would
+        silently misalign against a peer's full-history block list.
+        Safe today because fast_sync_from_snapshot has never adopted a
+        snapshot in production (see the state_hash/blocks-population
+        fixes elsewhere in this changeset) -- but a genuine fork
+        encountered AFTER a real snapshot-adoption would need this
+        rewritten to compare by height (block.index), not list index."""
         n = min(len(self.chain), len(peer_blocks))
         for i in range(n):
             if self.chain[i].hash != peer_blocks[i]["hash"]:
@@ -3390,7 +3416,7 @@ class Network:
         self.eco.update(imp.energy, self.emission, alive)
 
         prev  = self.chain[-1].hash if self.chain else "0" * 64
-        block = Block(len(self.chain), prev, imp, "NETWORK", 0)
+        block = Block(self.chain_height, prev, imp, "NETWORK", 0)
         self.chain.append(block)
         self._demote_old_blocks()
         if len(self.chain) == 1:
@@ -3408,7 +3434,7 @@ class Network:
         """Processing with a validator"""
         self.mempool.pop(0)
 
-        reward = self.emission.mint_reward(validator, len(self.chain), imp.t)
+        reward = self.emission.mint_reward(validator, self.chain_height, imp.t)
         if reward > 0:
             db.credit(validator.address, reward)
 
@@ -3423,7 +3449,7 @@ class Network:
         self.eco.update(imp.energy, self.emission, alive)
 
         prev  = self.chain[-1].hash if self.chain else "0" * 64
-        block = Block(len(self.chain), prev, imp, addr, reward)
+        block = Block(self.chain_height, prev, imp, addr, reward)
         self.chain.append(block)
         self._demote_old_blocks()
         if len(self.chain) == 1:
@@ -3528,7 +3554,7 @@ class Network:
                 _cold_count += 1
             if self.chain and block.prev_hash != self.chain[-1].hash:
                 raise RuntimeError(
-                    f"[FATAL] chain integrity break detected at block {len(self.chain)} "
+                    f"[FATAL] chain integrity break detected at block {self.chain_height} "
                     f"during restore -- its prev_hash does not match the previous "
                     f"block's actual hash. The local database is corrupted and this "
                     f"node refuses to start on it. Restore biochain.db from the most "
@@ -3545,7 +3571,7 @@ class Network:
                 self.vesting.start_time = self.chain[0].t
                 db.set_vesting_start(self.chain[0].t)
 
-        now_block = len(self.chain)
+        now_block = self.chain_height
         legacy_corrected = 0
         for node in self.nodes.values():
             if not node.alive:
@@ -3571,7 +3597,7 @@ class Network:
             "biofield": {
                 "phi_bio": round(self.phi_bio(), 6),
             },
-            "chain_len":    len(self.chain),
+            "chain_len":    self.chain_height,
             "mempool":      len(self.mempool),
             "wallets":      db.count_wallets(),
             "emerge_threshold": EMERGE_THRESHOLD,
@@ -3601,7 +3627,19 @@ class Network:
                 return 0
             return 0
 
-        end = len(self.chain) if limit is None else min(from_block + limit, len(self.chain))
+        # from_block is a HEIGHT (the caller wants blocks starting at
+        # that block's real index), not a list position -- these are
+        # only the same number when self.chain starts at height 0. If
+        # this node was bootstrapped from a state snapshot (sparse
+        # history, self.chain[0] is some anchor at height > 0, not
+        # genesis), from_block must be translated into the correct
+        # LIST offset by subtracting the first loaded block's real
+        # index. Requests for a height we don't have (before our
+        # anchor) correctly return nothing, matching a full node's
+        # "no such block" behavior rather than silently misaligning.
+        base_index = self.chain[0].index if self.chain else 0
+        start_pos  = max(0, from_block - base_index)
+        end_pos    = len(self.chain) if limit is None else min(start_pos + limit, len(self.chain))
         if not detail:
             # Skips .impulse entirely -- for a _LazyBlock (anything past
             # CHAIN_HOT_WINDOW) that property triggers its own DB lookup
@@ -3617,7 +3655,7 @@ class Network:
                     "validator": b.validator,
                     "reward":    round(sat_to_bio(b.reward), 4),
                 }
-                for b in self.chain[from_block:end]
+                for b in self.chain[start_pos:end_pos]
             ]
         return [
             {
@@ -3635,7 +3673,7 @@ class Network:
                     "fee":      round(sat_to_bio(fee_for(b.impulse)), 6),
                 },
             }
-            for b in self.chain[from_block:end]
+            for b in self.chain[start_pos:end_pos]
         ]
 
 def _replay_candidate_chain(candidate_blocks: list):
@@ -3879,7 +3917,7 @@ def sync_with_peer(peer_url: str):
         return
 
     their_len = info.get("chain_len", 0)
-    my_len    = len(net.chain)
+    my_len    = net.chain_height
     if their_len <= my_len:
         return
 
@@ -3901,7 +3939,7 @@ def sync_with_peer(peer_url: str):
             break
         applied += 1
     if applied:
-        print(f"[PEER] caught up {applied} block(s) from {peer_url} -- now at {len(net.chain)}")
+        print(f"[PEER] caught up {applied} block(s) from {peer_url} -- now at {net.chain_height}")
 
     if not fork_detected:
         return
@@ -3982,6 +4020,37 @@ def fast_sync_from_snapshot(peer_url: str) -> bool:
                 db.conn.executemany(
                     f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})",
                     [tuple(r[c] for c in cols) for r in rows])
+            # v5.44 fix: the snapshot itself never includes the `blocks`
+            # table (by design -- see SNAPSHOT_TABLES), but without AT
+            # LEAST the anchor block at this exact height, net.restore()
+            # rebuilds an EMPTY in-memory chain from an empty blocks
+            # table, and every subsequent peer-sync attempt would think
+            # chain_len==0 and try to refetch the ENTIRE history from
+            # block 0 -- defeating the whole point of fast-sync. Fetch
+            # just this one block from the same peer and seed it here.
+            anchor_page = _fetch_peer_chain(peer_url, height - 1, max_blocks=1)
+            if not anchor_page or anchor_page[0].get("index") != height - 1:
+                raise RuntimeError(f"peer did not return the anchor block at index {height - 1}")
+            anchor = anchor_page[0]
+            db.conn.execute("DELETE FROM blocks")
+            db.conn.execute("""
+                INSERT OR REPLACE INTO blocks VALUES
+                (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                anchor["index"], anchor["hash"], anchor["prev_hash"],
+                anchor["validator"],
+                anchor["reward"], anchor["timestamp"],
+                anchor["imp_id"],
+                anchor["imp_sender"], anchor["imp_receiver"],
+                anchor["imp_value"], anchor["imp_energy"],
+                anchor["imp_phi_bio"],
+                anchor.get("imp_pubkey", "") or "",
+                anchor.get("imp_signature", "") or "",
+                anchor.get("imp_signed_ts", 0.0) or 0.0,
+                anchor.get("imp_kind", "TRANSFER") or "TRANSFER",
+                anchor.get("imp_payload", "") or "",
+                anchor.get("imp_nonce", 0) or 0,
+            ))
             db.conn.commit()
         db.wal_checkpoint()
     except Exception as e:
@@ -4495,12 +4564,12 @@ def biofield():
         "nodes_alive":       len(alive),
         "nodes_total":       len(net.nodes),
         "wallets_total":     db.count_wallets(),
-        "blocks":            len(net.chain),
+        "blocks":            net.chain_height,
         "genesis_remaining": Emission.GENESIS_MAX_COUNT - net.emission.genesis_granted,
         "phase": (
-            "GENESIS"   if len(net.chain) < 10  else
-            "EXPANSION" if len(net.chain) < 30  else
-            "RESONANCE" if len(net.chain) < 60  else
+            "GENESIS"   if net.chain_height < 10  else
+            "EXPANSION" if net.chain_height < 30  else
+            "RESONANCE" if net.chain_height < 60  else
             "BLOOM"
         ),
     }
@@ -4682,8 +4751,8 @@ def verify():
                            f"destroyed) (diff: {sat_to_bio(diff):+,.8f})"}
     return {
         "valid":   True,
-        "message": f"chain is valid ({len(net.chain)} blocks)",
-        "blocks":  len(net.chain),
+        "message": f"chain is valid ({net.chain_height} blocks)",
+        "blocks":  net.chain_height,
         "supply_check": f"{sat_to_bio(grand_total):,.4f} / {sat_to_bio(max_supply_sat):,.4f} BIO exact "
                         f"({sat_to_bio(net.emission.total_destroyed):,.4f} BIO permanently destroyed via fee burning)",
     }
@@ -4713,7 +4782,7 @@ class PeerBlockBody(BaseModel):
 def peer_chain_info():
     """Lightweight check so a peer can tell, without downloading anything, whether its own chain is shorter/longer/different from ours."""
     return {
-        "chain_len":    len(net.chain),
+        "chain_len":    net.chain_height,
         "latest_hash":  net.chain[-1].hash if net.chain else "0" * 64,
         "genesis_hash": net.chain[0].hash if net.chain else "",
         "instance_id":  INSTANCE_ID,
@@ -4841,19 +4910,24 @@ def peer_chain(from_block: int = 0, limit: int = PEER_CHAIN_MAX_LIMIT, request: 
     if not peer_chain_rate_limiter.check(client_ip, limit=PEER_CHAIN_RATE_LIMIT_PER_MIN, window=PEER_CHAIN_RATE_LIMIT_WINDOW):
         return {"error": f"Rate limit exceeded: max {PEER_CHAIN_RATE_LIMIT_PER_MIN} requests per minute"}
     limit = max(1, min(limit, PEER_CHAIN_MAX_LIMIT))
-    chain_len = len(net.chain)
-    end = min(from_block + limit, chain_len)
+    # from_block is a HEIGHT (the caller's own chain_height, asking "give
+    # me blocks starting at my next expected index"), not a list position
+    # -- see chain_view()'s identical translation for why these diverge
+    # once this node was itself bootstrapped from a state snapshot.
+    base_index = net.chain[0].index if net.chain else 0
+    start_pos  = max(0, from_block - base_index)
+    end_pos    = min(start_pos + limit, len(net.chain))
     out = []
-    for b in net.chain[from_block:end]:
+    for b in net.chain[start_pos:end_pos]:
         out.append(Network.block_to_peer_dict(b))
-    return {"blocks": out, "chain_len": chain_len, "has_more": end < chain_len}
+    return {"blocks": out, "chain_len": net.chain_height, "has_more": end_pos < len(net.chain)}
 
 @app.post("/peer/block")
 def peer_block(body: PeerBlockBody):
     """Receives a new block from a peer."""
     ok, reason = net.apply_peer_block(body.model_dump())
     if ok:
-        return {"status": "ok", "chain_len": len(net.chain)}
+        return {"status": "ok", "chain_len": net.chain_height}
     return {"status": "rejected", "reason": reason}
 
 @app.get("/db")
@@ -5547,6 +5621,7 @@ def checkpoints():
                 "block_hash":  r["block_hash"][:16],
                 "created_at":  round(r["created_at"]),
                 "nodes_alive": r["nodes_alive"],
+                "state_hash":  r["state_hash"],
             }
             for r in rows
         ],
@@ -5575,7 +5650,7 @@ def save_snapshot(request: Request = None):
     snapshot = {
         "version":    "5.3",
         "timestamp":  now,
-        "chain_len":  len(net.chain),
+        "chain_len":  net.chain_height,
         "nodes":      len(net.nodes),
         "economy":    net.eco.state(),
         "emission":   net.emission.state(),
@@ -5595,7 +5670,7 @@ def save_snapshot(request: Request = None):
     return {
         "status":   "ok",
         "file":     fname,
-        "chain_len":len(net.chain),
+        "chain_len":net.chain_height,
         "nodes":    len(net.nodes),
     }
 
@@ -5654,7 +5729,7 @@ async def ws_endpoint(ws: WebSocket):
                     "nodes_alive": len(alive),
                     "nodes_total": len(net.nodes),
                     "wallets":     db.count_wallets(),
-                    "chain":       len(net.chain),
+                    "chain":       net.chain_height,
                     "mempool":     len(net.mempool),
                     "liquidity":   round(net.eco.liquidity, 2),
                     "risk":        round(net.eco.risk, 4),
