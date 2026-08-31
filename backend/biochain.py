@@ -4185,19 +4185,27 @@ def gossip_loop():
             last_prune = now
         _shutdown_event.wait(_gossip_interval())
 
-FAST_SYNC_ENABLED = False  # disabled 2026-07-26: known gap -- after a
-# successful snapshot load, net.chain has no entry for the snapshot
-# height (blocks is deliberately not part of SNAPSHOT_TABLES, by design,
-# to keep fast-sync fast), so a subsequent sync_with_peer() call sees
-# my_len=0 and re-requests + re-applies the ENTIRE real chain from block
-# 0 on top of already-current snapshot balances -- double-applying every
-# historical transaction's effects, not just genesis grants (those ARE
-# already correctly idempotency-guarded). Needs a real placeholder-chain
-# design (net.chain populated up to snapshot height with stand-ins that
-# carry the REAL chain hash at height-1, so the first real block
-# received afterward can still validate its own prev_hash correctly) --
-# not a quick patch. Ordinary sync_with_peer() block-by-block catch-up
-# is unaffected and remains the only sync path while this is disabled.
+FAST_SYNC_ENABLED = True  # re-enabled 2026-08-31 (v5.44): the gap
+# described below is fixed -- fast_sync_from_snapshot() now seeds
+# net.chain with a real anchor block (the actual block at height-1,
+# fetched from the peer, carrying its real hash) after adopting a
+# snapshot, so a block received immediately afterward validates its
+# own prev_hash correctly against that anchor, not against an empty
+# chain. Network.chain_height (tip.index + 1, not len(self.chain)) and
+# every call site that previously conflated "current height" with
+# "how many block objects happen to be loaded" were audited and fixed
+# for this same reason -- a sparse chain (anchor-only, not full history
+# from 0) is now handled correctly throughout, not just at the sync
+# entry point. Verified: full 258-check regression suite clean (2
+# known-unrelated failures, predate this change), plus a dedicated
+# end-to-end test driving two separate node instances through a real
+# adopt-a-snapshot-from-a-peer-with-real-data cycle and normal
+# incremental catch-up afterward. Known, still-open, documented
+# limitation: fork resolution (_find_divergence_index/resolve_fork)
+# compares by list position, not real height -- a genuine fork
+# encountered by a node that bootstrapped via snapshot-adopt would
+# misalign. Ordinary sync_with_peer() block-by-block catch-up remains
+# unaffected either way.
 
 if PEER_URLS:
     for _peer in PEER_URLS:
