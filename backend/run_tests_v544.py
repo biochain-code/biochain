@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 """
-BioChain v5.39 regression suite (98 tests: int-money + HTLC + checkpoints + prod fixes).
-Covers the same criteria as the v5.32 suite (chain integrity, value
-conservation, emission/halving, replay, double spend, determinism,
-atomicity, reward-fix, stake, governance) PLUS int-specific invariants
-(exact supply to the sat, no float dust, canonical signature strings).
+BioChain v5.44 regression suite (271 checks: int-money + HTLC +
+checkpoints + prod fixes + Kimi-review rounds + stress tests +
+crypto agility facade + real fast state-sync). Grown incrementally
+since the v5.32 suite (chain integrity, value conservation,
+emission/halving, replay, double spend, determinism, atomicity,
+reward-fix, stake, governance) through int-specific invariants
+(exact supply to the sat, no float dust, canonical signature strings),
+2026-07-26/07-28 audit-fix rounds, real multithreading and fork-race
+tests, fee-model consensus safety, and (section 38) a real two-node
+fast_sync_from_snapshot() adoption plus ordinary catch-up on the
+resulting sparse chain -- not just self-recognition, which is all
+section 33 exercises.
 
 Runs in two modes automatically:
   - sandbox: deterministic crypto/web stubs (no pip, no network)
   - device:  real dilithium_py + fastapi if importable
+
+Section 38 additionally works correctly whether app.routes is a real
+FastAPI route list or this file's own dict-based stub -- see
+_normalize_routes38().
 """
 import sys, os, types, time, json, sqlite3, hashlib
 
@@ -2050,3 +2061,214 @@ if FAIL:
     print("Провалены:"); [print("  -", f) for f in FAIL]
     sys.exit(1)
 print("МОДЕЛЬ КОМИССИИ СОГЛАСОВАНА МЕЖДУ ОБОИМИ ПУТЯМИ ПРИМЕНЕНИЯ БЛОКА.")
+
+# ============================================================
+# 38 -- fast_sync_from_snapshot() end to end (2026-08-31): re-enabled
+# after §16/§37's chain_height fix (see MATH_SPEC.md §16). Section 33.8
+# only tests SELF-recognition (a peer that turns out to be us) -- it
+# never exercises a genuine, successful snapshot adoption from a
+# DIFFERENT node, which is the actual point of the whole mechanism.
+# This drives that real path: forces bc (this suite's own instance,
+# already carrying real history from sections 1-37) to snapshot itself
+# early, has a second, fully independent, freshly-loaded instance adopt
+# it over real HTTP-shaped requests, and then -- the part nothing else
+# in this suite touches -- syncs one further ordinary block on top of
+# the resulting sparse chain.
+# ============================================================
+print("\n[38] fast_sync_from_snapshot(): реальный приём снимка вторым узлом")
+
+# Защитная очистка перед стартом: более ранние разделы (15.7, 15.15,
+# 15.17 и другие) создают тестовые checkpoint'ы/снимки на фиктивных
+# высотах (999000, 5000, 10000...), некоторые из которых 15.17 же и
+# удаляет с диска в рамках проверки ротации -- оставляя "битые" записи
+# checkpoint в БД без файла на диске. fast_sync_from_snapshot() иначе
+# выбрал бы такую запись как "самую свежую доступную" вместо настоящей
+# высоты сети. Убираем ВСЁ, что выше реальной текущей высоты -- не
+# трогая сам механизм checkpoint/snapshot, только тестовый мусор.
+_real_height_38 = bc.net.chain_height
+bc.db.conn.execute("DELETE FROM checkpoints WHERE block_idx >= ?", (_real_height_38,))
+bc.db.conn.commit()
+if os.path.isdir(bc.SNAPSHOT_DIR):
+    for _stale_snap_38 in os.listdir(bc.SNAPSHOT_DIR):
+        if _stale_snap_38.startswith("state_") and _stale_snap_38.endswith(".json"):
+            try:
+                _h_38 = int(_stale_snap_38[len("state_"):-len(".json")])
+            except ValueError:
+                continue
+            if _h_38 >= _real_height_38:
+                try:
+                    os.remove(os.path.join(bc.SNAPSHOT_DIR, _stale_snap_38))
+                except OSError:
+                    pass
+bc.net._rebuild_death_schedule()
+bc.net._invalidate_alive_cache()
+
+# Более ранние разделы (например, 34.5) проверяют откат ПОСЛЕ ошибки
+# посреди транзакции -- in-memory откат (bc.net.nodes) там подтверждён
+# верным, но обнаружилось: соответствующая запись в САМОЙ БД (таблица
+# nodes) не всегда откатывается синхронно с этим, оставляя "осиротевшие"
+# тестовые узлы, которых снимок унаследует, хотя в живой сети их нет.
+# Это отдельная, настоящая находка (см. отчёт), не связанная с работой
+# сегодняшнего дня -- здесь просто синхронизируем БД с реальным
+# in-memory состоянием перед тем, как строить снимок, чтобы раздел 38
+# тестировал СЕТЕВОЙ механизм, а не унаследованный чужой тестовый мусор.
+_live_addrs_38 = set(bc.net.nodes.keys())
+_db_addrs_38 = {row["address"] for row in bc.db.conn.execute("SELECT address FROM nodes").fetchall()}
+_orphaned_38 = _db_addrs_38 - _live_addrs_38
+if _orphaned_38:
+    for _orphan_addr_38 in _orphaned_38:
+        bc.db.conn.execute("DELETE FROM nodes WHERE address=?", (_orphan_addr_38,))
+    bc.db.conn.commit()
+    print(f"  [CLEANUP] раздел 38: убраны осиротевшие DB-записи узлов, отсутствующих in-memory: {_orphaned_38}")
+
+import importlib.util as _importlib38
+from urllib.parse import urlparse as _urlparse38, parse_qs as _parse_qs38
+
+class _FakeResp38:
+    def __init__(self, data):
+        self._data = data
+        self._body = json.dumps(data).encode("utf-8")
+    def json(self):
+        return self._data
+    def iter_content(self, chunk_size=65536):
+        yield self._body
+
+def _normalize_routes38(app):
+    """Настоящий FastAPI хранит app.routes как СПИСОК объектов APIRoute
+    (.path, .methods, .endpoint); тестовая заглушка -- как словарь
+    (метод, путь) -> функция. Приводим оба варианта к единому списку
+    (метод, путь, функция), чтобы роутер работал одинаково что в
+    песочнице (заглушка), что на реальном сервере (настоящий fastapi)."""
+    routes = app.routes
+    if isinstance(routes, dict):
+        return [(method, path, handler) for (method, path), handler in routes.items()]
+    out = []
+    for r in routes:
+        methods = getattr(r, "methods", None)
+        path = getattr(r, "path", None)
+        endpoint = getattr(r, "endpoint", None)
+        if not methods or path is None or endpoint is None:
+            continue
+        for m in methods:
+            out.append((m, path, endpoint))
+    return out
+
+def _make_router38(peer_module):
+    _routes38 = _normalize_routes38(peer_module.app)
+    def _coerce(v):
+        if isinstance(v, str) and v.lstrip("-").isdigit():
+            return int(v)
+        return v
+    def _get(url, params=None, timeout=None, stream=False):
+        parsed = _urlparse38(url)
+        path = parsed.path
+        query_params = {k: _coerce(v[0]) for k, v in _parse_qs38(parsed.query).items()}
+        if params:
+            query_params.update({k: _coerce(v) for k, v in params.items()})
+        for method, route_path, handler in _routes38:
+            if method != "GET":
+                continue
+            if route_path == path:
+                return _FakeResp38(handler(**query_params) if query_params else handler())
+            if "{" in route_path:
+                prefix = route_path.split("{")[0]
+                if path.startswith(prefix):
+                    tail = path[len(prefix):]
+                    param_name = route_path.split("{")[1].split("}")[0]
+                    kwargs = {param_name: _coerce(tail), **query_params}
+                    return _FakeResp38(handler(**kwargs))
+        raise Exception(f"нет обработчика для {path}")
+    return _get
+
+# 38.1 -- узел A: принудительный ранний снимок текущего состояния bc
+# (та же техника, что и §15.7, просто на реальной, а не тестовой высоте)
+_height_38 = bc.net.chain_height
+bc.db.save_checkpoint(_height_38, bc.net.chain[-1].hash if bc.net.chain else "0"*64, len([n for n in bc.net.nodes_snapshot() if n.alive]))
+_snap_38 = bc.build_state_snapshot()
+_snap_hash_38 = bc.canonical_state_hash(_snap_38)
+bc.write_snapshot_file(_height_38, _snap_38)
+bc.db.set_checkpoint_state_hash(_height_38, _snap_hash_38)
+check(f"38.1 снимок узла A принудительно создан на текущей высоте ({_height_38})",
+      os.path.isfile(os.path.join(bc.SNAPSHOT_DIR, f"state_{_height_38}.json")))
+
+# 38.2 -- узел B: полностью независимая, свежая загрузка того же
+# исходного файла в ОТДЕЛЬНОЙ тестовой директории -- никакого общего
+# состояния с bc, кроме кода.
+_test_dir_38 = os.path.join(os.path.dirname(TEST_DIR), "bc_test_v534_node_b_38")
+os.makedirs(_test_dir_38, exist_ok=True)
+for _fdb38 in os.listdir(_test_dir_38):
+    if _fdb38.startswith("biochain.db"):
+        os.remove(os.path.join(_test_dir_38, _fdb38))
+_snap_dir_38 = os.path.join(_test_dir_38, "snapshots")
+if os.path.isdir(_snap_dir_38):
+    _shutil.rmtree(_snap_dir_38)
+_old_cwd_38 = os.getcwd()
+os.chdir(_test_dir_38)
+try:
+    _spec_38 = _importlib38.spec_from_file_location("bc_node_b_38", SRC)
+    bc_b = _importlib38.module_from_spec(_spec_38)
+    _spec_38.loader.exec_module(bc_b)
+finally:
+    os.chdir(_old_cwd_38)
+bc_b.ENFORCE_SUPPLY_INVARIANT_PER_BLOCK = False
+check("38.2 узел B стартовал полностью пустым", bc_b.net.chain_height == 0,
+      f"got {bc_b.net.chain_height}")
+
+# 38.3 -- настоящий вызов fast_sync_from_snapshot(peer=A) на узле B,
+# через смоделированный HTTP-роутер поверх реальных зарегистрированных
+# обработчиков узла A (не прямой вызов функций A в обход сети).
+bc_b.http_requests.get = _make_router38(bc)
+bc_b.HTTP_OK = True
+_result_38 = bc_b.fast_sync_from_snapshot("http://node-a-38.internal")
+check("38.3 fast_sync_from_snapshot вернул True (снимок реально принят)",
+      _result_38 is True, _result_38)
+check(f"38.4 высота узла B ПОСЛЕ синхронизации == реальной высоте узла A ({_height_38})",
+      bc_b.net.chain_height == _height_38,
+      f"got {bc_b.net.chain_height}, expected {_height_38}")
+check("38.5 в памяти узла B ровно один блок (якорь, не полная история)",
+      len(bc_b.net.chain) == 1, f"got {len(bc_b.net.chain)}")
+if bc_b.net.chain:
+    check(f"38.6 якорный блок имеет верный index ({_height_38 - 1})",
+          bc_b.net.chain[0].index == _height_38 - 1,
+          f"got {bc_b.net.chain[0].index}")
+
+# 38.7 -- chain_view() узла B корректно переводит запрошенную высоту в
+# позицию списка (не даёт списку "уехать" из-за разреженной истории)
+_view_38 = bc_b.net.chain_view(from_block=_height_38 - 1, limit=10)
+check("38.7 chain_view(from_block=высота_якоря) отдаёт ровно якорный блок",
+      len(_view_38) == 1 and _view_38[0]["index"] == _height_38 - 1,
+      _view_38)
+
+# 38.8-38.9 -- обычный догон ПОСЛЕ разреженного приёма: узел A получает
+# новый импульс, узел B забирает его через /peer/chain и применяет --
+# это единственная часть всего сценария, которую больше нигде в этом
+# наборе не проверить, поскольку она требует РЕАЛЬНОГО разрыва истории,
+# а не только факта успешного fast_sync.
+_pk38, _sk38 = bc.Dilithium.keygen()
+_addr38 = "BIO1" + hashlib.sha3_256(_pk38).hexdigest()[:32].upper()
+bc.db.ensure_wallet(_addr38)
+_ts38 = time.time()
+_msg38 = f"REGISTER|{_addr38}|{_ts38:.6f}|1"
+_sig38 = bc.Dilithium.sign(_sk38, _msg38.encode())
+_resp38 = bc.register(bc.RegisterBody(address=_addr38, pubkey=_pk38.hex(), signature=_sig38.hex(), timestamp=_ts38, nonce=1))
+check("38.8 узел A: новый REGISTER для догона прошёл", "error" not in _resp38, _resp38.get("error"))
+
+_peer_page_38 = bc.peer_chain(from_block=bc_b.net.chain_height, limit=10)
+_applied_38 = 0
+_last_reason_38 = None
+for _block_data_38 in _peer_page_38["blocks"]:
+    _ok38, _reason38 = bc_b.net.apply_peer_block(_block_data_38)
+    _last_reason_38 = _reason38
+    if _ok38:
+        _applied_38 += 1
+check("38.9 узел B применил ровно 1 новый блок догона поверх разреженной истории",
+      _applied_38 == 1, f"applied={_applied_38}, last_reason={_last_reason_38}")
+check("38.10 высоты узлов A и B совпадают после догона",
+      bc_b.net.chain_height == bc.net.chain_height,
+      f"A={bc.net.chain_height} B={bc_b.net.chain_height}")
+
+print(f"\n=== ИТОГ (включая раздел 38): {len(PASS)} PASS / {len(FAIL)} FAIL ===")
+if FAIL:
+    print("Провалены:"); [print("  -", f) for f in FAIL]
+    sys.exit(1)
+print("FAST_SYNC_FROM_SNAPSHOT РЕАЛЬНО РАБОТАЕТ НА РАЗРЕЖЕННОЙ ИСТОРИИ.")
