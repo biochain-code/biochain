@@ -16,8 +16,7 @@ address(pk) = "BIO1" + SHA3-256(pk)[:32].upper()
 coordinated with a full network genesis reset — not a backward-compatible
 change.** The 64-bit version was a real, if impractical-today, weakness:
 a targeted second-preimage attack against one specific existing address
-needed ~2^64 attempts (not the ~2^32 birthday bound, which only finds
-*some* collision among an attacker's own freshly-generated keys and
+needed ~2^64 attempts (not the ~2^32 birthday bound, which only finds *some* collision among an attacker's own freshly-generated keys and
 grants no access to anyone else's funds — the two are frequently
 conflated and are not the same threat model). At 128 bits the same
 targeted attack needs ~2^128 — including Grover's quadratic quantum
@@ -26,8 +25,7 @@ stays firmly in "not achievable by any realistic adversary, today or
 for a long horizon" territory, unlike the 64-bit original.
 
 This intentionally did NOT go through the scheme_id agility mechanism
-described below (which exists precisely for changes like this) — the
-`"MLDSA44"` scheme's own formula was changed directly, wallet and
+described below (which exists precisely for changes like this) — the `"MLDSA44"` scheme's own formula was changed directly, wallet and
 backend updated in lockstep, and the chain reset to genesis rather than
 carrying old-format addresses forward. That was the pragmatic call
 specifically because the network was still small enough (two nodes, no
@@ -97,26 +95,26 @@ Where:
 
 Fixed at genesis, immutable:
 
-| Pool | Share | Amount (BIO) |
-|---|---|---|
-| Validators | 40.00% | 8,400,000 |
-| Ecosystem | 30.00% | 6,300,000 |
-| Reserve | 20.00% | 4,200,000 |
-| Team (vesting) | 5.00% | 1,050,000 |
-| Genesis grants | 3.90% | 820,000 |
-| Listing reserve | 1.10% | 230,000 |
-| **Total** | **100.00%** | **21,000,000** |
+| Pool            | Share       | Amount (BIO)   |
+| --------------- | ----------- | -------------- |
+| Validators      | 40.00%      | 8,400,000      |
+| Ecosystem       | 30.00%      | 6,300,000      |
+| Reserve         | 20.00%      | 4,200,000      |
+| Team (vesting)  | 5.00%       | 1,050,000      |
+| Genesis grants  | 3.90%       | 820,000        |
+| Listing reserve | 1.10%       | 230,000        |
+| **Total**       | **100.00%** | **21,000,000** |
 
 The six categories above sum to exactly `21,000,000 BIO` — no unassigned remainder. (An earlier version of this document incorrectly claimed 510,000 BIO was held back; that was a documentation arithmetic error, corrected here — the actual pool constants in code always summed to the full cap.)
 
 **What happens to the 820,000 BIO genesis-grants pool after genesis (v5.40):** it is not one flat, single-purpose bucket. At the network's first boot, three separate carve-outs happen automatically, once each:
 
-| Use | Amount (BIO) | Timing |
-|---|---|---|
-| Founder's starting operating balance | 10,000 | Once, at genesis |
-| Wallet-registration grant pool (§3a) | 1,000 | Once, carved from the founder's own balance |
-| Developer + server-operator grants pool (§3b/§3c) | 509,000 | Once, moved out of `pool_genesis` directly; split 254,500/254,500 in v5.41 |
-| Remaining for tiered genesis grants (§3) | up to 300,000 | Ongoing, as new addresses qualify |
+| Use                                               | Amount (BIO)  | Timing                                                                     |
+| ------------------------------------------------- | ------------- | -------------------------------------------------------------------------- |
+| Founder's starting operating balance              | 10,000        | Once, at genesis                                                           |
+| Wallet-registration grant pool (§3a)              | 1,000         | Once, carved from the founder's own balance                                |
+| Developer + server-operator grants pool (§3b/§3c) | 509,000       | Once, moved out of `pool_genesis` directly; split 254,500/254,500 in v5.41 |
+| Remaining for tiered genesis grants (§3)          | up to 300,000 | Ongoing, as new addresses qualify                                          |
 
 `10,000 + 1,000 + 509,000 + 300,000 = 820,000` — exactly the genesis pool's full allocation, none of it unaccounted for.
 
@@ -285,7 +283,6 @@ to_pool(fee)    = fee − destroyed(fee)            -- flows into pool_validator
 
 `total_destroyed` (cumulative, persisted) directly reduces the supply-invariant target in §1: `21,000,000 BIO − total_destroyed`, not a fixed number once `FEE_BURN_PERCENT > 0`. Launched at `0%` deliberately — the mechanism is fully built and tested, but real deflationary pressure is deferred until the network has matured. Raising it later requires only a governance vote, no code deployment.
 
-
 ## 6. Organic Node Emergence
 
 ```
@@ -300,10 +297,8 @@ energy_decay_per_block = 0.02
 ENERGY_DEATH = 5.0
 ```
 
-**Fixed-point since v5.43 (BC-001, July 2026):** `energy`, `reputation`,
-`recent_activity`, and `risk` are stored and computed as exact integers
-scaled by `CONSENSUS_SCALE = 1,000,000` internally (e.g. `energy = 8.0`
-is stored as `8,000,000`), not as `float`. The values and formulas below
+**Fixed-point since v5.43 (BC-001, July 2026):** `energy`, `reputation`, `recent_activity`, and `risk` are stored and computed as exact integers
+scaled by `CONSENSUS_SCALE = 1,000,000` internally (e.g. `energy = 8.0` is stored as `8,000,000`), not as `float`. The values and formulas below
 are given in their real-world (unscaled) meaning; the scaling is a pure
 implementation detail chosen specifically so two independent peers can
 never compute even a single-bit-different result for the same inputs,
@@ -339,11 +334,9 @@ corrected to match, not a behavior change.
 
 **`recent_activity` decay** (used in `weight()`, §6a) is multiplicative,
 not additive: `recent_activity(t+1) = recent_activity(t) × 0.95^elapsed`.
-Implemented as an exact integer ratio (`0.95 = 19⁄20` precisely, so
-`× 19^elapsed ÷ 20^elapsed`, integer division, no rounding drift), with
+Implemented as an exact integer ratio (`0.95 = 19⁄20` precisely, so `× 19^elapsed ÷ 20^elapsed`, integer division, no rounding drift), with
 one bounded exception: for `elapsed ≥ 512` blocks since last touched,
-the result is set directly to `0` rather than computed — at
-`CONSENSUS_SCALE` precision, `0.95^512` is already smaller than the
+the result is set directly to `0` rather than computed — at `CONSENSUS_SCALE` precision, `0.95^512` is already smaller than the
 smallest representable unit, so this is exact, not an approximation,
 and avoids computing a needlessly enormous exact integer power for a
 node that hasn't been touched in a long time.
@@ -572,72 +565,69 @@ strategy changed, for performance.** The one exception is noted
 explicitly:
 
 - Validator-selection formula (section on organic node emergence /
-  role weight): unchanged. A cached, sorted alive-address list replaces
-  re-sorting every alive node on every impulse; invalidated exactly on
-  birth, death, or rebirth. 313 -> up to 425,386 selections/sec measured
-  at 12,000 alive nodes on production hardware.
+role weight): unchanged. A cached, sorted alive-address list replaces
+re-sorting every alive node on every impulse; invalidated exactly on
+birth, death, or rebirth. 313 -> up to 425,386 selections/sec measured
+at 12,000 alive nodes on production hardware.
 - Energy decay (`energy(t+1) = energy(t) - ENERGY_DECAY_RATE + ...`):
-  unchanged as a formula. Previously recomputed for every alive node on
-  every block; now computed lazily and exactly for a specific node only
-  when that node is actually touched (`Node.materialize()`), with death
-  timing precomputed once via `ceil((energy - ENERGY_DEATH) /
-  ENERGY_DECAY_RATE)` and revised only when that node's energy actually
-  changes. Verified against the original per-block formula over a
-  400-block simulation with intermixed touches: 49/50 test nodes
-  produced bit-identical energy and alive/dead status; the 50th differed
-  by exactly one block due to floating-point accumulation from ~400
-  sequential subtractions versus one batched multiplication (~1e-13
-  magnitude) -- a one-time migration-boundary artifact, not an ongoing
-  cross-peer divergence risk, since every peer running the same new code
-  computes the identical closed-form result.
+unchanged as a formula. Previously recomputed for every alive node on
+every block; now computed lazily and exactly for a specific node only
+when that node is actually touched (`Node.materialize()`), with death
+timing precomputed once via `ceil((energy - ENERGY_DEATH) / ENERGY_DECAY_RATE)` and revised only when that node's energy actually
+changes. Verified against the original per-block formula over a
+400-block simulation with intermixed touches: 49/50 test nodes
+produced bit-identical energy and alive/dead status; the 50th differed
+by exactly one block due to floating-point accumulation from ~400
+sequential subtractions versus one batched multiplication (~1e-13
+magnitude) -- a one-time migration-boundary artifact, not an ongoing
+cross-peer divergence risk, since every peer running the same new code
+computes the identical closed-form result.
 - State-checkpoint hash / chain integrity check (`state_hash`,
-  section 11's canonical-form check, and the separate prev_hash
-  link-check `/verify` performs): unchanged as a check. Previously
-  rescanned the full chain on every `/verify` call; now caches how far
-  the chain has already been confirmed intact, since a previously-valid
-  link can never become invalid later (blocks are immutable once
-  appended). 12.53ms -> 0.04ms at 100,000 blocks (335x); 28.00ms ->
-  0.04ms at 500,000 blocks (667x).
+section 11's canonical-form check, and the separate prev_hash
+link-check `/verify` performs): unchanged as a check. Previously
+rescanned the full chain on every `/verify` call; now caches how far
+the chain has already been confirmed intact, since a previously-valid
+link can never become invalid later (blocks are immutable once
+appended). 12.53ms -> 0.04ms at 100,000 blocks (335x); 28.00ms ->
+0.04ms at 500,000 blocks (667x).
 - In-memory rollback on a failed transaction: unchanged in what it
-  guarantees (full restoration of every balance a failed transaction
-  touched). Previously snapshotted every alive node's balance before
-  every transaction; now records only the specific nodes actually
-  touched, via a property on `Node.balance`, regardless of which of the
-  many code paths that can change a balance is responsible. Verified on
-  a three-node scenario (sender, receiver, and an unrelated third node)
-  that all three balances restore exactly on a simulated failure.
+guarantees (full restoration of every balance a failed transaction
+touched). Previously snapshotted every alive node's balance before
+every transaction; now records only the specific nodes actually
+touched, via a property on `Node.balance`, regardless of which of the
+many code paths that can change a balance is responsible. Verified on
+a three-node scenario (sender, receiver, and an unrelated third node)
+that all three balances restore exactly on a simulated failure.
 - Chain storage: no consensus-relevant formula involved. Blocks older
-  than a configurable hot window (currently the most recent 50,000)
-  are held as lightweight references (hash, prev_hash, index, validator,
-  reward, timestamp only) instead of full objects; full impulse detail
-  for an old block loads from the database on the rare access that
-  actually needs it, and is verified byte-for-byte identical to the
-  original after that reload. This is the fix for the four-minute
-  `/verify` finding: at 258,938 blocks without it, block-generation
-  throughput fell from ~1,900 blocks/sec to ~90 blocks/sec under
-  uncontrolled memory growth; at 500,000 blocks with it, generation
-  speed and available memory both stayed flat throughout, tested
-  directly on production hardware -- confirmed via a throwaway instance
-  on server1's actual hardware, synthetically generating 60,000 blocks
-  to exercise the hot/cold boundary, not sandbox-only. **Not yet
-  exercised against the real, live chain as of this writing** -- the
-  live chain is at block 191, far short of the 50,000-block hot window
-  boundary, so the cold-storage path has been confirmed on production
-  hardware but never yet on production data.
+than a configurable hot window (currently the most recent 50,000)
+are held as lightweight references (hash, prev_hash, index, validator,
+reward, timestamp only) instead of full objects; full impulse detail
+for an old block loads from the database on the rare access that
+actually needs it, and is verified byte-for-byte identical to the
+original after that reload. This is the fix for the four-minute
+`/verify` finding: at 258,938 blocks without it, block-generation
+throughput fell from ~1,900 blocks/sec to ~90 blocks/sec under
+uncontrolled memory growth; at 500,000 blocks with it, generation
+speed and available memory both stayed flat throughout, tested
+directly on production hardware -- confirmed via a throwaway instance
+on server1's actual hardware, synthetically generating 60,000 blocks
+to exercise the hot/cold boundary, not sandbox-only. **Not yet
+exercised against the real, live chain as of this writing** -- the
+live chain is at block 191, far short of the 50,000-block hot window
+boundary, so the cold-storage path has been confirmed on production
+hardware but never yet on production data.
 - SQLite WAL checkpointing: not a chain-consensus matter at all --
-  pure local disk housekeeping, explicitly safe for different peers to
-  perform at completely different times or frequencies with zero
-  cross-peer effect. Found necessary after a real incident: SQLite's own
-  automatic checkpointing fell behind under sustained write load in
-  these same tests, letting the WAL file grow to 1.9GB, at which point a
-  single-row primary-key lookup (exactly what the chain-storage fix
-  above depends on) took 89.5 seconds instead of under a millisecond. An
-  explicit checkpoint every 5,000 blocks, issued only after each
-  transaction's own commit completes, keeps the WAL file bounded --
-  verified to return to 0 bytes at each interval. **Confirmed live in
-  production** on both servers July 21, 2026: manual `PRAGMA
-  wal_checkpoint` returned `0|656|656` (server1) and `0|599|599`
-  (server2) -- not busy, every outstanding frame checkpointed.
+pure local disk housekeeping, explicitly safe for different peers to
+perform at completely different times or frequencies with zero
+cross-peer effect. Found necessary after a real incident: SQLite's own
+automatic checkpointing fell behind under sustained write load in
+these same tests, letting the WAL file grow to 1.9GB, at which point a
+single-row primary-key lookup (exactly what the chain-storage fix
+above depends on) took 89.5 seconds instead of under a millisecond. An
+explicit checkpoint every 5,000 blocks, issued only after each
+transaction's own commit completes, keeps the WAL file bounded --
+verified to return to 0 bytes at each interval. **Confirmed live in
+production** on both servers July 21, 2026: manual `PRAGMA wal_checkpoint` returned `0|656|656` (server1) and `0|599|599` (server2) -- not busy, every outstanding frame checkpointed.
 
 **The one exception -- an actual parameter-governability change:**
 
@@ -669,7 +659,6 @@ this is considered fully closed out.
 
 ---
 
-
 ## 15. Security Hardening (July 2026) — DEPLOYED July 28, 2026
 
 Prompted by several independent rounds of automated code review between
@@ -688,8 +677,7 @@ against, not by which review round raised them.
 
 **Per-block supply invariant enforcement.** The five-bucket check in §1
 was previously only ever run on demand, via `/verify`. It now also runs
-automatically after every single block, in production, using the same
-`_check_supply_invariant()` code `/verify` itself calls — not a
+automatically after every single block, in production, using the same `_check_supply_invariant()` code `/verify` itself calls — not a
 duplicate. If it fails, the entire block is rolled back (database and
 in-memory state together) before it is ever persisted or relayed to a
 peer, via the same rollback path a rejected transaction already used.
@@ -763,8 +751,7 @@ and then making the actual liveness-check request were two separate
 steps, each independently resolving the hostname — a malicious DNS
 server could answer safely for the first resolution and differently for
 the second, bypassing the check entirely. The liveness-check request
-now connects directly to the exact IP already verified safe (with a
-`Host` header preserving correct routing on the peer's side), closing
+now connects directly to the exact IP already verified safe (with a `Host` header preserving correct routing on the peer's side), closing
 that window completely for `http://` candidates. `https://` candidates
 are a deliberate, disclosed exception: substituting a verified IP into
 an HTTPS request breaks TLS certificate-hostname validation, and
@@ -814,14 +801,12 @@ during the narrow window a fork-resolution adoption is actively
 replacing that same structure. A new, single-purpose thread-safe lookup
 closes this for both endpoints without the cost of copying the entire
 node set the way the existing bulk-read path already safely does for
-list-returning endpoints (`/nodes`, `/dashboard`, `/validators`,
-`/longevity`), which were already correctly using it and needed no
+list-returning endpoints (`/nodes`, `/dashboard`, `/validators`, `/longevity`), which were already correctly using it and needed no
 change.
 
 **Graceful shutdown and stalled-checkpoint visibility.** The three
 long-running background loops (peer sync, gossip, signature pruning)
-now check a shared shutdown flag instead of running an unconditional
-`while True`, and the process now installs `SIGTERM`/`SIGINT` handlers
+now check a shared shutdown flag instead of running an unconditional `while True`, and the process now installs `SIGTERM`/`SIGINT` handlers
 that set this flag and trigger one final WAL checkpoint before actually
 exiting — verified directly: killed and restarted five times in a row
 under real `SIGTERM`, real `SIGKILL` (immediately after startup, mid
@@ -847,17 +832,17 @@ state — ordinary block-by-block sync, which does not have this gap, is
 unaffected and remains the only sync path a new node uses today. A
 correct fix needs the local chain populated with placeholder entries
 carrying the real hash at the snapshot boundary specifically, so a
-block received immediately afterward can still validate its own
-`prev_hash` correctly — scoped, understood, and deliberately deferred
-rather than rushed.
+block received immediately afterward can still validate its own `prev_hash` correctly — scoped, understood, and deliberately deferred
+rather than rushed. **Update, August 31, 2026: this gap is fixed — see §16.**
 
 **Regression coverage.** The suite grew from 194 checks (§14) to 253,
-covering every fix above individually, each confirmed both against a
-lightweight crypto stub (fast iteration during development) and,
-separately, against the real ML-DSA-44 backend on actual production
-hardware — the full 253-check run completing with zero failures on
-server1's real liboqs backend is what is now confirmed, not merely the
-stub-backed version. A structural class of bug the rest of the suite
+then to 261 with §16's work below, covering every fix above
+individually, each confirmed both against a lightweight crypto stub
+(fast iteration during development) and, separately, against the real
+ML-DSA-44 backend on actual production hardware — the full 261-check
+run completing with zero failures on real liboqs, on both servers
+independently, is what is now confirmed, not merely the stub-backed
+version. A structural class of bug the rest of the suite
 cannot catch by construction — an HTTP route decorator silently bound to
 the wrong function, since every other check calls Python functions
 directly rather than through FastAPI's own routing layer — is now
@@ -878,4 +863,102 @@ intervention on server2's side.
 
 ---
 
-*BioChain AAECN — Mathematical Specification, corresponding to code v5.43*
+## 16. Crypto Agility Facade and Real Fast State-Sync — DEPLOYED August 31, 2026
+
+Two related pieces of work, deployed together: a structural abstraction
+layer with no behavioral change, and a genuine fix to the gap §15
+identified and deliberately left disabled.
+
+**Crypto agility facade.** A `SignatureVerifier` interface
+(`biochain_facade/interfaces.py`) now sits between the rest of the
+codebase and the actual cryptographic implementation
+(`biochain_facade/impl_python.py`, a verbatim port of the pre-existing
+`PQCrypto` class — cross-checked line by line against the original, not
+rewritten). `biochain.py`'s four direct call sites
+(`pq.address()`/`pq.verify()`) now go through `get_verifier()`
+(`biochain_facade/facade.py`) instead — a five-line diff to
+`biochain.py` itself, everything else new files. The entire point: when
+a non-Python signature-verification implementation exists (for
+instance, a Rust service, developed separately and in parallel to this
+work), switching to it becomes a two-line import change in `facade.py`,
+not a codebase-wide search-and-replace. No such implementation exists
+yet — this is foundation only, the same "lays groundwork only" caveat
+as the `scheme_id` mechanism in §0. Verified byte-for-byte identical to
+the original: same address from the same public key, a signature made
+by either the facade or the original verifies correctly under both,
+and a tampered message is rejected by both — confirmed on real liboqs,
+independently on server1 and server2, before deploy.
+
+**The §15 fast-sync gap, actually fixed.** §15 disabled
+`FAST_SYNC_ENABLED` over a specific, identified problem: after adopting
+a snapshot, nothing re-established the local chain's length, so a
+block received immediately afterward couldn't validate its own
+`prev_hash`, and ordinary sync would silently re-fetch the entire
+chain from block zero on top of already-current balances.
+`fast_sync_from_snapshot()` now fetches the real block at the
+snapshot's boundary height from the peer (not a placeholder — the
+actual block, with its actual hash) and inserts it as an anchor before
+adopting the snapshot, so a block received immediately afterward
+validates correctly against it.
+
+That fix alone surfaced a second, related problem during testing:
+`len(self.chain)` — the length of the in-memory block list — was used
+throughout the codebase interchangeably with "the network's current
+height," which is only true when the chain is contiguous from block 0.
+Once a node can legitimately hold a *sparse* chain (an anchor block at
+some height greater than zero, not full history beneath it), the two
+diverge. A new `Network.chain_height` property (the tip block's real
+index + 1, read directly from the block itself, never from list
+length) now serves every one of the roughly 30 call sites that
+genuinely meant "current height" — block creation, block-index
+validation, reward-height parameters, peer-sync catch-up requests,
+every `chain_len` field returned by any endpoint. Ordinary use of
+`len(self.chain)` — rollback truncation to a saved list position,
+hot/cold storage window arithmetic (§14), `/verify`'s own
+already-verified-position bookkeeping — is unaffected by design; those
+genuinely mean list length, not height, and were individually confirmed
+to still mean that before being left alone. `chain_view()` and
+`GET /peer/chain` — the two endpoints that serve block ranges to a
+peer by requested height — now translate that requested height into
+the correct list offset via the first loaded block's own real index,
+rather than using the requested height directly as a list index, which
+would misalign on a sparse chain.
+
+**Known limitation, not fixed in this pass, documented at the call
+site.** Fork resolution (§12, `_find_divergence_index`) still compares
+a local chain against a peer's offered chain by list position, not by
+real height. A node that bootstrapped via a real snapshot adoption
+(sparse chain) and subsequently encountered a genuine fork would
+misalign under this comparison. Safe today because production has
+never actually held a sparse chain before this deployment. Ordinary
+`sync_with_peer()` block-by-block catch-up, which does not use this
+comparison, is unaffected either way.
+
+**Verification.** The regression suite grew to 261 checks, including a
+new, explicit consensus-safety check (§37.15 in the suite) that the two
+independent code paths which can apply a block — a locally-originated
+one (`Network.send`) and one received from a peer
+(`Network._apply_peer_block_locked`) — debit the sender the identical
+`value + fee` formula, not two formulas that happen to currently agree.
+All 261 checks pass with zero failures, confirmed independently on real
+liboqs on both server1 and server2, not merely a crypto stub. A
+dedicated end-to-end test, separate from the general suite, drives two
+fully independent node instances through the specific scenario this
+section describes: a node with real chain history forces an early
+snapshot, a second, empty node adopts it via `fast_sync_from_snapshot()` over real HTTP-shaped requests, its resulting
+height and anchor block are checked directly, and — the part no
+existing test exercised — a further ordinary block is then
+peer-synced on top of that sparse history and applied correctly. Also
+run clean on real liboqs, independently, on both production nodes,
+before deploy.
+
+Both production nodes were stopped, backed up (database and code,
+timestamped), updated, and restarted with `FAST_SYNC_ENABLED = True`;
+both verified `valid: true` with the exact 21,000,000 BIO supply
+invariant and identical `chain_len` immediately after switching, and
+again after a live transaction was independently submitted to confirm
+ordinary operation was unaffected.
+
+---
+
+*BioChain AAECN — Mathematical Specification, corresponding to code v5.44*
