@@ -836,10 +836,10 @@ block received immediately afterward can still validate its own `prev_hash` corr
 rather than rushed. **Update, August 31, 2026: this gap is fixed — see §16.**
 
 **Regression coverage.** The suite grew from 194 checks (§14) to 253,
-then to 261 with §16's work below, covering every fix above
+then to 271 with §16/§38's work below, covering every fix above
 individually, each confirmed both against a lightweight crypto stub
 (fast iteration during development) and, separately, against the real
-ML-DSA-44 backend on actual production hardware — the full 261-check
+ML-DSA-44 backend on actual production hardware — the full 271-check
 run completing with zero failures on real liboqs, on both servers
 independently, is what is now confirmed, not merely the stub-backed
 version. A structural class of bug the rest of the suite
@@ -934,23 +934,27 @@ never actually held a sparse chain before this deployment. Ordinary
 `sync_with_peer()` block-by-block catch-up, which does not use this
 comparison, is unaffected either way.
 
-**Verification.** The regression suite grew to 261 checks, including a
+**Verification.** The regression suite grew to 271 checks, including a
 new, explicit consensus-safety check (§37.15 in the suite) that the two
 independent code paths which can apply a block — a locally-originated
 one (`Network.send`) and one received from a peer
 (`Network._apply_peer_block_locked`) — debit the sender the identical
 `value + fee` formula, not two formulas that happen to currently agree.
-All 261 checks pass with zero failures, confirmed independently on real
-liboqs on both server1 and server2, not merely a crypto stub. A
-dedicated end-to-end test, separate from the general suite, drives two
-fully independent node instances through the specific scenario this
-section describes: a node with real chain history forces an early
-snapshot, a second, empty node adopts it via `fast_sync_from_snapshot()` over real HTTP-shaped requests, its resulting
-height and anchor block are checked directly, and — the part no
-existing test exercised — a further ordinary block is then
-peer-synced on top of that sparse history and applied correctly. Also
-run clean on real liboqs, independently, on both production nodes,
-before deploy.
+All 271 checks pass with zero failures, confirmed independently on real
+liboqs on both server1 and server2, not merely a crypto stub. Section 38
+of the suite drives two fully independent node instances through the
+specific scenario this section describes: a node with real chain
+history forces an early snapshot, a second, empty node adopts it via
+`fast_sync_from_snapshot()` over real HTTP-shaped requests, its
+resulting height and anchor block are checked directly, and — the part
+section 33's self-recognition checks never exercise — a further
+ordinary block is then peer-synced on top of that sparse history and
+applied correctly. This section was added, and found and fixed a
+genuine router/environment gap in the process: it initially passed
+clean against the suite's own sandbox crypto stub but failed against
+real liboqs on server1, because that environment has real fastapi
+installed (`app.routes` is a route list there, not the stub's dict) —
+now handles both correctly.
 
 Both production nodes were stopped, backed up (database and code,
 timestamped), updated, and restarted with `FAST_SYNC_ENABLED = True`;
