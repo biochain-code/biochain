@@ -16,7 +16,7 @@ def _mk(name):
 
 def load_biochain_instance(test_dir, module_name):
     """Загружает СВЕЖУЮ, полностью изолированную копию biochain.py."""
-    # Заглушки -- те же самые, что в run_tests_v543_FINAL17_termux.py
+    # Заглушки -- те же самые, что в run_tests_v544.py
     if 'fastapi' not in sys.modules:
         fastapi = _mk('fastapi')
         class FastAPI:
